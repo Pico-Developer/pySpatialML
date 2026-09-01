@@ -1,0 +1,121 @@
+name: Publish to PyPI
+
+# Publishes pyspatialml-pico to PyPI.
+#
+# IMPORTANT: This workflow must live on the PUBLIC repo's default branch
+# (Pico-Developer/pySpatialML @ main). The mirror sync deletes .github/workflows
+# before pushing, so it is NOT propagated from the private mirror — add/commit it
+# directly on the public repo.
+#
+# Auth uses a PyPI API token stored as a GitHub Actions secret (no Trusted
+# Publisher account required).
+# One-time setup:
+#   1. Create a PyPI API token at https://pypi.org/manage/account/token/
+#      (scope it to the pyspatialml-pico project after the first upload; the
+#      very first upload needs an account-wide token since the project does
+#      not exist yet).
+#   2. On the PUBLIC repo: Settings > Secrets and variables > Actions >
+#      New repository secret, named PYPI_API_TOKEN, value = the token
+#      (including the "pypi-" prefix).
+#   3. (Optional) Add a required reviewer to the "pypi" environment for a
+#      manual approval gate before publishing.
+
+on:
+  # Automatic: publish when a GitHub Release is published.
+  release:
+    types: [published]
+  # Manual: "Run workflow" button in the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Verify version matches release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          PKG_VERSION="$(python -c 'import securemr; print(securemr.__version__)')"
+          echo "Package version (securemr.__version__): ${PKG_VERSION}"
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "No release tag (manual run); skipping tag/version match check."
+            exit 0
+          fi
+          # Strip an optional leading 'v' from the tag (e.g. v0.5.0 -> 0.5.0).
+          TAG_VERSION="${RELEASE_TAG#v}"
+          echo "Release tag version: ${TAG_VERSION}"
+          if [ "${PKG_VERSION}" != "${TAG_VERSION}" ]; then
+            echo "::error::Version mismatch: securemr.__version__=${PKG_VERSION} but release tag=${RELEASE_TAG} (${TAG_VERSION})."
+            exit 1
+          fi
+          echo "Version matches release tag."
+
+      - name: Ensure version is not already on PyPI
+        run: |
+          PKG_VERSION="$(python -c 'import securemr; print(securemr.__version__)')"
+          URL="https://pypi.org/pypi/pyspatialml-pico/${PKG_VERSION}/json"
+          echo "Checking ${URL}"
+          HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${URL}")"
+          echo "HTTP status: ${HTTP_CODE}"
+          case "${HTTP_CODE}" in
+            404)
+              echo "Version ${PKG_VERSION} not found on PyPI; OK to publish."
+              ;;
+            200)
+              echo "::error::pyspatialml-pico ${PKG_VERSION} already exists on PyPI. Bump securemr.__version__ before releasing."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected HTTP ${HTTP_CODE} from PyPI while checking existing versions; aborting."
+              exit 1
+              ;;
+          esac
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distributions
+        run: python -m twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pyspatialml-pico/
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -38,7 +38,7 @@ def __getattr__(name: str):  # noqa: D401
         return getattr(_pipeline_zoo, name)
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
-__version__ = "0.0.1"
+__version__ = "0.5.0"
 __all__ = [
     "BaseType",
     "EDataType",

@@ -43,8 +43,12 @@ managed runtime and CLI environment.
 ### Pip
 
 ```bash
-python3.13 -m pip install pyspatialml
+python3.13 -m pip install pyspatialml-pico
 ```
+
+The distribution is published on PyPI as `pyspatialml-pico`, but the CLI is
+still `pyspatialml` and the import packages are still `securemr` and
+`pyspatialml`.
 
 ### Manual install
 ```bash
