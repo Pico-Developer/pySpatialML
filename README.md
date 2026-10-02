@@ -134,11 +134,27 @@ pyspatialml pipeline init pipeline.json
 pyspatialml pipeline add-tensor pipeline.json image --shape 128,128,3 --dtype uint8 --input
 pyspatialml pipeline add-tensor pipeline.json image_f32 --shape 128,128,3 --dtype float32
 pyspatialml pipeline add-tensor pipeline.json normalized --shape 128,128,3 --dtype float32 --output
-pyspatialml pipeline add-op pipeline.json assignment --input image --output image_f32
-pyspatialml pipeline add-op pipeline.json arithmetic --input image_f32 --output normalized --expression "{0} / 255.0"
+pyspatialml pipeline add-op pipeline.json XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO --src image --dst image_f32
+pyspatialml pipeline add-op pipeline.json XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO --operand0 image_f32 --result normalized --expression "{0} / 255.0"
 pyspatialml pipeline validate pipeline.json
 pyspatialml pipeline inspect pipeline.json
 ```
+
+`pipeline add-op` names each input switch after the operator operand. Spaces
+in operand names become dashes, so `src image` is `--src-image`; names such as
+`alpha_beta` retain their underscore. Switch order does not affect
+the positional order written to `inputs`. Results work the same way: for
+example, SolvePnP uses `--rotation` and `--translation` in any CLI order but
+writes them in canonical `outputs` order. Use `pyspatialml operator describe-op
+OP_TYPE` to list both sets of switches. Model and JavaScript operators have
+dynamic names; use `--NAME TENSOR` or `--named-input NAME=TENSOR` for inputs,
+and `--named-output NAME=TENSOR` for outputs.
+
+Structurally valid parser fixtures containing every supported operator for each
+execution mode are available at `examples/all_xr_operators_pipeline.json` and
+`examples/all_spatial_operators_pipeline.json`. Their model and glTF paths are
+placeholders because the fixtures are intended for parsing and schema
+validation, not execution.
 
 Trace a Python function decorated with `securemr.py2smr.trace`:
 

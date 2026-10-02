@@ -82,6 +82,11 @@ class TraceContext:
         self.tensors: Dict[str, TensorInfo] = {}
         self._tensor_counter = 0
         self._tensor_id_map: Dict[int, str] = {}  # id(ndarray) -> tensor_name
+        # Keep the actual ndarray objects alive for the duration of tracing.
+        # The id-based lookup is only safe while those objects remain alive;
+        # helper operators commonly create temporary constant arrays, and
+        # Python may otherwise reuse their ids for a later tensor.
+        self._tensor_objects: Dict[int, np.ndarray] = {}
 
     def _generate_tensor_name(self, prefix: str = "tensor") -> str:
         """Generate a unique tensor name."""
@@ -100,6 +105,7 @@ class TraceContext:
             is_input=True,
         )
         self._tensor_id_map[id(tensor)] = tensor_name
+        self._tensor_objects[id(tensor)] = tensor
         return tensor_name
 
     def register_tensor(
@@ -107,6 +113,7 @@ class TraceContext:
         tensor: np.ndarray,
         name: Optional[str] = None,
         is_output: bool = False,
+        value: Optional[np.ndarray] = None,
     ) -> str:
         """Register an intermediate or output tensor."""
         # Check if tensor is already registered
@@ -122,10 +129,11 @@ class TraceContext:
             name=tensor_name,
             shape=tensor.shape,
             dtype=tensor.dtype,
-            value=tensor.copy() if is_output else None,
+            value=tensor.copy() if is_output or value is not None else None,
             is_output=is_output,
         )
         self._tensor_id_map[tensor_id] = tensor_name
+        self._tensor_objects[tensor_id] = tensor
         return tensor_name
 
     def get_tensor_name(self, tensor: np.ndarray) -> Optional[str]:
@@ -272,6 +280,8 @@ class TracedFunction:
             ctx.mark_outputs(outputs)
         elif isinstance(result, dict):
             ctx.mark_outputs(result)
+        elif result is None and not self._output_names:
+            pass
         else:
             raise TypeError(
                 f"Function must return ndarray, tuple/list of ndarrays, or dict. "

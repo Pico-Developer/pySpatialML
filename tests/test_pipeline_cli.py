@@ -15,6 +15,27 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _add_render_text_tensors(path):
+    existing = _read_json(path)["tensors"]
+    specs = {
+        "text_data": ("1", "uint8", "scalar", 1),
+        "text_origin": ("1", "float32", "point", 2),
+        "text_color": ("2", "uint8", "color", 4),
+        "gltf": ("1,1", "uint8", "gltf", None),
+        "texture_ids": ("1", "uint16", "scalar", 1),
+        "text_bounds": ("1", "float32", "scalar", 1),
+    }
+    for name, (shape, dtype, usage, channels) in specs.items():
+        if name not in existing:
+            pipeline_cli.add_tensor(
+                path, name, shape=shape, dtype=dtype, usage=usage, channels=channels
+            )
+
+
+def _render_text_inputs():
+    return ["text_data", "text_origin", "text_color", "gltf", "texture_ids", "text_bounds"]
+
+
 def test_init_pipeline_refuses_existing_file_without_force(tmp_path):
     pipeline = tmp_path / "pipeline.json"
 
@@ -67,7 +88,6 @@ def test_add_tensor_marks_gltf_usage_for_sdk_loader(tmp_path):
 
     tensor = _read_json(pipeline)["tensors"]["scene"]
     assert tensor["usage"] == 7
-    assert tensor["tensor_type"] == "gltf"
     assert tensor["is_gltf"] is True
     assert tensor["is_placeholder"] is True
     assert tensor["asset"] == "gltf/frame.gltf"
@@ -87,36 +107,50 @@ def test_add_tensor_supports_scalar_values(tmp_path):
     )
 
     tensor = _read_json(pipeline)["tensors"]["threshold"]
-    assert tensor["dimensions"] == [1, 1]
+    assert tensor["dimensions"] == [1]
     assert tensor["channels"] == 1
     assert tensor["usage"] == 2
-    assert tensor["value"] == [0.5]
+    assert tensor["data"] == [0.5]
     assert "flag" not in tensor
 
 
-def test_add_op_supports_inline_affine_points_and_assignment_slices(tmp_path):
+def test_add_tensor_supports_explicit_timestamp_channels(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+
+    pipeline_cli.add_tensor(
+        pipeline, "timestamp", shape="1", dtype="int32",
+        usage="timestamp", channels=4,
+    )
+
+    tensor = _read_json(pipeline)["tensors"]["timestamp"]
+    assert tensor["dimensions"] == [1]
+    assert tensor["channels"] == 4
+    assert tensor["data_type"] == 5
+    assert tensor["usage"] == 5
+
+
+def test_add_op_supports_affine_refs_and_assignment_slices(tmp_path):
     pipeline = tmp_path / "pipeline.json"
     pipeline_cli.init_pipeline(pipeline)
     for name in ("src", "dst", "affine"):
         pipeline_cli.add_tensor(pipeline, name, shape="3,2", dtype="float32")
     pipeline_cli.add_op(
         pipeline,
-        "get_affine",
-        inputs=[],
+        "XR_SECURE_MR_OPERATOR_TYPE_GET_AFFINE_PICO",
+        inputs=["src", "dst"],
         outputs=["affine"],
-        src_points="[[0, 0], [1, 0], [0, 1]]",
-        dst_points="[[1, 1], [2, 1], [1, 2]]",
     )
     pipeline_cli.add_op(
         pipeline,
-        "assignment",
+        "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
         inputs=["src"],
         outputs=["dst"],
         src_slices="[[0, 2, 1], [0, 2, 1]]",
         dst_slices="[[1, 3, 1], [0, 2, 1]]",
     )
     operators = _read_json(pipeline)["operators"]
-    assert operators[0]["src_points"] == [[0, 0], [1, 0], [0, 1]]
+    assert operators[0]["inputs"] == [{"tensor": "src"}, {"tensor": "dst"}]
     assert operators[1]["src_slices"] == [[0, 2, 1], [0, 2, 1]]
 
 
@@ -126,13 +160,13 @@ def test_add_op_type_convert_uses_assignment_operation_identity(tmp_path):
     pipeline_cli.add_tensor(pipeline, "input", shape="2,2", dtype="float32")
     pipeline_cli.add_tensor(pipeline, "output", shape="2,2", dtype="int32")
 
-    pipeline_cli.add_op(pipeline, "type_convert", inputs=["input"], outputs=["output"])
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO", inputs=["input"], outputs=["output"])
 
     operator = _read_json(pipeline)["operators"][0]
     assert operator == {
         "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-        "inputs": ["input"],
-        "outputs": ["output"],
+        "inputs": [{"tensor": "input"}],
+        "outputs": [{"tensor": "output"}],
     }
 
 
@@ -156,7 +190,7 @@ def test_add_op_writes_common_operator_fields(tmp_path):
 
     pipeline_cli.add_op(
         pipeline,
-        "arithmetic",
+        "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
         inputs=["x"],
         outputs=["y"],
         expression="{0} + 1.0",
@@ -165,10 +199,73 @@ def test_add_op_writes_common_operator_fields(tmp_path):
 
     op = _read_json(pipeline)["operators"][0]
     assert op["type"] == "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO"
-    assert op["inputs"] == ["x"]
-    assert op["outputs"] == ["y"]
-    assert op["attrs"] == ["unused"]
-    assert op["expression"] == "{0} + 1.0"
+    assert op["inputs"] == [{"tensor": "x"}]
+    assert op["outputs"] == [{"tensor": "y"}]
+    assert op["attrs"] == ["{0} + 1.0"]
+    assert "expression" not in op
+
+
+def test_add_op_normalize_accepts_optional_alpha_beta_slot(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    pipeline_cli.add_tensor(pipeline, "x", shape="2,2", dtype="float32", is_input=True)
+    pipeline_cli.add_tensor(pipeline, "y", shape="2,2", dtype="float32", is_output=True)
+    pipeline_cli.add_tensor(pipeline, "alpha_beta", shape="2", dtype="float32")
+
+    pipeline_cli.add_op(
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_NORMALIZE_PICO",
+        inputs=["x"],
+        outputs=["y"],
+    )
+    pipeline_cli.add_op(
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_NORMALIZE_PICO",
+        inputs=["x", "alpha_beta"],
+        outputs=["y"],
+    )
+
+    operators = _read_json(pipeline)["operators"]
+    assert operators[0]["inputs"] == [{"tensor": "x"}]
+    assert operators[1]["inputs"] == [{"tensor": "x"}, {"tensor": "alpha_beta"}]
+
+
+def test_add_op_rejects_middle_gap_not_representable_in_schema_v2(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    pipeline_cli.add_tensor(pipeline, "rotation", shape="1,3", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "scale", shape="1,3", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "result", shape="4,4", dtype="float32")
+
+    with pytest.raises(pipeline_cli.PipelineCliError, match="cannot represent an omitted operator slot"):
+        pipeline_cli.add_op(
+            pipeline,
+            "XR_SECURE_MR_OPERATOR_TYPE_MAKE_TRANSFORM_MAT_PICO",
+            inputs=["rotation", None, "scale"],
+            outputs=["result"],
+        )
+
+
+def test_add_op_microphone_writes_spatialsdk_v2_outputs(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    pipeline_cli.add_tensor(pipeline, "stereo", shape="128,2", dtype="float32")
+    pipeline_cli.add_tensor(
+        pipeline, "timestamp", shape="1", dtype="int32", usage="timestamp", channels=4
+    )
+
+    pipeline_cli.add_op(
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO",
+        inputs=[],
+        outputs=["stereo", "timestamp"],
+        attrs=["48000;PCM_FLOAT"],
+    )
+
+    assert _read_json(pipeline)["operators"][0]["outputs"] == [
+        {"tensor": "stereo"},
+        {"tensor": "timestamp"},
+    ]
 
 
 def test_add_op_arithmetic_requires_expression(tmp_path):
@@ -178,18 +275,18 @@ def test_add_op_arithmetic_requires_expression(tmp_path):
     pipeline_cli.add_tensor(pipeline, "y", shape="2,2", dtype="float32", is_output=True)
 
     with pytest.raises(pipeline_cli.PipelineCliError, match="Arithmetic operators require --expression"):
-        pipeline_cli.add_op(pipeline, "arithmetic", inputs=["x"], outputs=["y"])
+        pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO", inputs=["x"], outputs=["y"])
 
 
 @pytest.mark.parametrize(
     ("op_type", "inputs", "outputs", "message"),
     [
-        ("convert_color", ["x"], ["y"], "convert_color operators require --flag"),
-        ("customized_compare", ["x", "y"], ["y"], "customized_compare operators require --attr"),
-        ("javascript", ["x"], ["y"], "javascript operators require --attr"),
-        ("render_text", ["gltf"], [], "render_text operators require --attr config and --attr text"),
-        ("update_gltf", ["gltf"], [], "update_gltf operators require --attr"),
-        ("run_model_inference", ["x"], ["y"], "run_model_inference operators require --model"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO", ["x"], ["y"], r"CONVERT_COLOR operators require flag or attrs\[0\]"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO", ["x", "y"], ["y"], r"customized_compare operators require comparison or attrs\[0\]"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO", ["x"], ["y"], r"JS_SCRIPTING operators require script or attrs\[0\]"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO", ["gltf", "x", "x", "gltf", "x", "x"], [], r"render_text operators require config or attrs\[0\]"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_UPDATE_GLTF_PICO", ["gltf"], [], r"update_gltf operators require update_type or attrs\[0\]"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO", ["x"], ["y"], "RUN_MODEL_INFERENCE operators require --model"),
     ],
 )
 def test_add_op_requires_operator_metadata(tmp_path, op_type, inputs, outputs, message):
@@ -204,15 +301,74 @@ def test_add_op_requires_operator_metadata(tmp_path, op_type, inputs, outputs, m
 
 
 @pytest.mark.parametrize(
+    "attrs",
+    [["8000;PCM_16BIT"], ["96000;PCM_32BIT"], ["48000;PCM_FLOAT"]],
+)
+def test_add_op_accepts_valid_microphone_attrs(tmp_path, attrs):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    encoding = attrs[0].split(";", 1)[1]
+    dtype = {"PCM_16BIT": "int16", "PCM_32BIT": "int32", "PCM_FLOAT": "float32"}[encoding]
+    pipeline_cli.add_tensor(pipeline, "stereo", shape="128,2", dtype=dtype)
+    pipeline_cli.add_tensor(pipeline, "left", shape="128,1", dtype=dtype)
+    pipeline_cli.add_tensor(pipeline, "right", shape="128,1", dtype=dtype)
+    pipeline_cli.add_tensor(
+        pipeline, "timestamp", shape="1", dtype="int32", usage="timestamp", channels=4
+    )
+
+    pipeline_cli.add_op(
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO",
+        inputs=[],
+        outputs=["stereo", "left", "right", "timestamp"],
+        attrs=attrs,
+    )
+
+    assert _read_json(pipeline)["operators"][0]["attrs"] == attrs
+
+
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        [],
+        ["48000;PCM_FLOAT", "16000;PCM_16BIT"],
+        ["7999;PCM_16BIT"],
+        ["96001;PCM_16BIT"],
+        ["0;PCM_16BIT"],
+        ["48000.0;PCM_16BIT"],
+        ["48000PCM_16BIT"],
+        ["48000;PCM_8BIT"],
+        ["48000;PCM_16BIT;extra"],
+    ],
+)
+def test_add_op_rejects_invalid_microphone_attrs(tmp_path, attrs):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    pipeline_cli.add_tensor(pipeline, "stereo", shape="128,2", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "left", shape="128,1", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "right", shape="128,1", dtype="float32")
+    pipeline_cli.add_tensor(
+        pipeline, "timestamp", shape="1", dtype="int32", usage="timestamp", channels=4
+    )
+
+    with pytest.raises(pipeline_cli.PipelineCliError):
+        pipeline_cli.add_op(
+            pipeline,
+            "XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO",
+            inputs=[],
+            outputs=["stereo", "left", "right", "timestamp"],
+            attrs=attrs,
+        )
+
+
+@pytest.mark.parametrize(
     ("op_type", "inputs", "outputs", "message"),
     [
-        ("convert_color", [], ["y"], "convert_color operators require exactly 1 input"),
-        ("elementwise_min", ["x"], ["y"], "elementwise_min operators require exactly 2 input"),
-        ("nms", ["x"], ["y"], "nms operators require exactly 2 input"),
-        ("solve_p_n_p", ["x", "y"], ["y", "z"], "solve_p_n_p operators require exactly 3 input"),
-        ("rectified_vst_access", ["x"], ["y"], "rectified_vst_access operators require exactly 0 input"),
-        ("svd", ["x"], [], "svd operators require 1 to 3 output"),
-        ("javascript", ["x"], [], "javascript operators require at least 1 output"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO", [], ["y"], "convert_color operators require exactly 1 input"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MIN_PICO", ["x"], ["y"], "elementwise_min operators require exactly 2 input"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_NMS_PICO", ["x"], ["y"], "nms operators require exactly 2 input"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_SOLVE_P_N_P_PICO", ["x", "y"], ["y", "z"], "solve_p_n_p operators require exactly 3 input"),
+        ("XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO", ["x"], ["y"], "rectified_vst_access operators require exactly 0 input"),
     ],
 )
 def test_add_op_rejects_bad_operator_arity(tmp_path, op_type, inputs, outputs, message):
@@ -233,11 +389,12 @@ def test_add_op_accepts_one_to_three_svd_outputs(tmp_path, outputs):
     for name in {"w", "u", "vt"}:
         pipeline_cli.add_tensor(pipeline, name, shape="2,2", dtype="float32")
 
-    pipeline_cli.add_op(pipeline, "svd", inputs=["x"], outputs=outputs)
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_SVD_PICO", inputs=["x"], outputs=outputs)
 
     spec = json.loads(pipeline.read_text(encoding="utf-8"))
     assert spec["operators"][-1]["type"].endswith("_SVD_PICO")
-    assert spec["operators"][-1]["outputs"] == outputs
+    expected_outputs = [{"tensor": name} for name in outputs]
+    assert spec["operators"][-1]["outputs"] == expected_outputs
 
 
 @pytest.mark.parametrize("outputs", [["scores"], ["scores", "boxes"], ["scores", "boxes", "indices"]])
@@ -246,14 +403,21 @@ def test_add_op_accepts_one_to_three_nms_outputs(tmp_path, outputs):
     pipeline_cli.init_pipeline(pipeline)
     pipeline_cli.add_tensor(pipeline, "scores", shape="3", dtype="float32")
     pipeline_cli.add_tensor(pipeline, "boxes", shape="3,4", dtype="float32")
-    for name in {"filtered_scores", "filtered_boxes", "indices"}:
-        pipeline_cli.add_tensor(pipeline, name, shape="3,4", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "filtered_scores", shape="3", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "filtered_boxes", shape="3,4", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "indices", shape="3", dtype="int32")
 
-    pipeline_cli.add_op(pipeline, "nms", inputs=["scores", "boxes"], outputs=outputs)
+    output_names = {"scores": "filtered_scores", "boxes": "filtered_boxes", "indices": "indices"}
+    pipeline_cli.add_op(
+        pipeline, "XR_SECURE_MR_OPERATOR_TYPE_NMS_PICO",
+        inputs=["scores", "boxes"],
+        outputs=[output_names[name] for name in outputs], threshold=0.5,
+    )
 
     spec = json.loads(pipeline.read_text(encoding="utf-8"))
     assert spec["operators"][-1]["type"].endswith("_NMS_PICO")
-    assert spec["operators"][-1]["outputs"] == outputs
+    expected_outputs = [{"tensor": output_names[name]} for name in outputs]
+    assert spec["operators"][-1]["outputs"] == expected_outputs
 
 
 def test_add_op_accepts_required_operator_metadata(tmp_path):
@@ -263,34 +427,65 @@ def test_add_op_accepts_required_operator_metadata(tmp_path):
     pipeline_cli.init_pipeline(pipeline)
     pipeline_cli.add_tensor(pipeline, "x", shape="2,2", dtype="float32", is_input=True)
     pipeline_cli.add_tensor(pipeline, "y", shape="2,2", dtype="float32", is_output=True)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(pipeline)
     pipeline_cli.add_tensor(pipeline, "texture", shape="2,2,3", dtype="uint8")
-    pipeline_cli.add_tensor(pipeline, "texture_ids", shape="1", dtype="uint16", usage="scalar")
 
-    pipeline_cli.add_op(pipeline, "convert_color", inputs=["x"], outputs=["y"], flag="4")
-    pipeline_cli.add_op(pipeline, "customized_compare", inputs=["x", "y"], outputs=["y"], attrs=[">="])
-    pipeline_cli.add_op(pipeline, "javascript", inputs=["x"], outputs=["y"], attrs=["out = in;"])
-    pipeline_cli.add_op(pipeline, "render_text", inputs=["gltf"], outputs=[], attrs=["bold#en-us#512#64", "hello"])
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO", inputs=["x"], outputs=["y"], flag="4")
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO", inputs=["x", "y"], outputs=["y"], attrs=[">="])
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO", inputs=["x"], outputs=["y"], attrs=["out = in;"])
     pipeline_cli.add_op(
-        pipeline, "update_gltf", inputs=["gltf", "texture", "texture_ids"], outputs=[], attrs=["texture"]
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
+        outputs=[],
+        attrs=["bold#en-us#512#64"],
     )
-    pipeline_cli.add_op(pipeline, "run_model_inference", inputs=["x"], outputs=["y"], model="model.tflite")
 
     operators = _read_json(pipeline)["operators"]
-    assert operators[0]["flag"] == 4
+    assert operators[0]["attrs"] == ["4"]
     assert operators[1]["attrs"] == [">="]
     assert operators[2]["attrs"] == ["out = in;"]
-    assert operators[3]["attrs"] == ["bold#en-us#512#64", "hello"]
-    assert operators[4]["attrs"] == ["texture"]
-    assert operators[3]["gltf"] == "gltf"
-    assert operators[3]["typeface"] == "bold"
-    assert operators[3]["language_and_locale"] == "en-us"
-    assert operators[3]["canvas_width"] == 512
-    assert operators[3]["canvas_height"] == 64
-    assert operators[3]["text"] == "hello"
-    assert operators[4]["gltf"] == "gltf"
-    assert operators[4]["update_type"] == "texture"
-    assert operators[5]["model"]["bin_path"] == "model.tflite"
+    assert operators[2]["type"] == "XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO"
+    assert operators[3]["attrs"] == ["bold#en-us#512#64"]
+    assert "flag" not in operators[0]
+    assert "script" not in operators[2]
+    assert "config" not in operators[3]
+    assert "text" not in operators[3]
+    assert operators[3]["inputs"] == [{"tensor": name} for name in _render_text_inputs()]
+
+
+@pytest.mark.parametrize(
+    ("op_type", "inputs", "outputs", "attrs"),
+    [
+        ("XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO", ["scene", "data"], [], []),
+        ("XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO", ["scene", "data"], [], []),
+        ("XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO", ["input"], ["output"], ["output = input;"]),
+    ],
+)
+def test_add_op_accepts_schema_operator_aliases(tmp_path, op_type, inputs, outputs, attrs):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    for name in {"scene", "data", "input", "output"}:
+        pipeline_cli.add_tensor(
+            pipeline,
+            name,
+            shape="1,1",
+            dtype="uint8" if name == "scene" else "float32",
+            usage="gltf" if name == "scene" else "matrix",
+        )
+
+    kwargs = {"attrs": attrs}
+    if op_type.endswith("UPDATE_COMPONENT_PICO"):
+        kwargs.update(entity_path="/target", property="Transform.Scale")
+    pipeline_cli.add_op(pipeline, op_type, inputs=inputs, outputs=outputs, **kwargs)
+
+    operator = _read_json(pipeline)["operators"][0]
+    assert operator["type"] == op_type
+    expected_attrs = ["/target:Transform.Scale"] if op_type.endswith("UPDATE_COMPONENT_PICO") else attrs
+    if expected_attrs:
+        assert operator["attrs"] == expected_attrs
+    else:
+        assert "attrs" not in operator
 
 
 def test_add_op_rejects_unknown_tensor_reference(tmp_path):
@@ -299,7 +494,7 @@ def test_add_op_rejects_unknown_tensor_reference(tmp_path):
     pipeline_cli.add_tensor(pipeline, "x", shape="1,1", dtype="float32")
 
     with pytest.raises(pipeline_cli.PipelineCliError, match="Unknown tensor"):
-        pipeline_cli.add_op(pipeline, "assignment", inputs=["x"], outputs=["missing"])
+        pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO", inputs=["x"], outputs=["missing"])
 
 
 def test_remove_tensor_removes_tensor_and_boundaries(tmp_path):
@@ -320,7 +515,7 @@ def test_remove_tensor_rejects_operator_references_without_force(tmp_path):
     pipeline_cli.init_pipeline(pipeline)
     pipeline_cli.add_tensor(pipeline, "x", shape="1,1", dtype="float32", is_input=True)
     pipeline_cli.add_tensor(pipeline, "y", shape="1,1", dtype="float32", is_output=True)
-    pipeline_cli.add_op(pipeline, "assignment", inputs=["x"], outputs=["y"])
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO", inputs=["x"], outputs=["y"])
 
     with pytest.raises(pipeline_cli.PipelineCliError) as exc_info:
         pipeline_cli.remove_tensor(pipeline, "x")
@@ -336,14 +531,14 @@ def test_remove_tensor_force_allows_dangling_operator_reference(tmp_path):
     pipeline_cli.init_pipeline(pipeline)
     pipeline_cli.add_tensor(pipeline, "x", shape="1,1", dtype="float32", is_input=True)
     pipeline_cli.add_tensor(pipeline, "y", shape="1,1", dtype="float32", is_output=True)
-    pipeline_cli.add_op(pipeline, "assignment", inputs=["x"], outputs=["y"])
+    pipeline_cli.add_op(pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO", inputs=["x"], outputs=["y"])
 
     assert pipeline_cli.remove_tensor(pipeline, "x", force=True) == 0
 
     spec = _read_json(pipeline)
     assert "x" not in spec["tensors"]
     assert spec["inputs"] == []
-    assert spec["operators"][0]["inputs"] == ["x"]
+    assert spec["operators"][0]["inputs"] == [{"tensor": "x"}]
 
 
 def test_remove_tensor_rejects_missing_tensor(tmp_path):
@@ -367,15 +562,15 @@ def test_add_op_rejects_xr_only_operator_when_manifest_supports_spatial(tmp_path
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(pipeline)
 
     with pytest.raises(pipeline_cli.PipelineCliError, match="XR-only operator.*only includes spatial"):
         pipeline_cli.add_op(
             pipeline,
-            "render_text",
-            inputs=["gltf"],
+            "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+            inputs=_render_text_inputs(),
             outputs=[],
-            attrs=["bold#en-us#512#64", "hello"],
+            attrs=["bold#en-us#512#64"],
         )
 
 
@@ -392,13 +587,13 @@ def test_add_op_rejects_spatial_only_operator_when_manifest_supports_xr(tmp_path
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8")
+    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8", usage="gltf")
     pipeline_cli.add_tensor(pipeline, "data", shape="1,1", dtype="float32")
 
     with pytest.raises(pipeline_cli.PipelineCliError, match="Spatial-only operator.*only includes xr"):
         pipeline_cli.add_op(
             pipeline,
-            "update_component",
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
             inputs=["component", "data"],
             outputs=[],
             entity_path="/target",
@@ -420,14 +615,14 @@ def test_add_op_with_xr_only_operator_narrows_both_mode_manifest(tmp_path):
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(pipeline)
 
     pipeline_cli.add_op(
         pipeline,
-        "render_text",
-        inputs=["gltf"],
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
         outputs=[],
-        attrs=["bold#en-us#512#64", "hello"],
+        attrs=["bold#en-us#512#64"],
     )
 
     assert _read_json(manifest)["runtime"]["supported_modes"] == ["xr"]
@@ -447,12 +642,12 @@ def test_add_op_with_spatial_only_operator_narrows_both_mode_manifest(tmp_path):
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8")
+    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8", usage="gltf")
     pipeline_cli.add_tensor(pipeline, "data", shape="1,1", dtype="float32")
 
     pipeline_cli.add_op(
         pipeline,
-        "update_component",
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
         inputs=["component", "data"],
         outputs=[],
         entity_path="/target",
@@ -467,17 +662,17 @@ def test_add_op_spatial_only_aliases_write_sdk_fields(tmp_path):
     pipeline_cli.init_pipeline(pipeline)
     pipeline_cli.add_tensor(pipeline, "scene", shape="1,1", dtype="uint8", usage="gltf")
     pipeline_cli.add_tensor(pipeline, "scale", shape="1,3", dtype="float32")
+    pipeline_cli.add_tensor(pipeline, "visible", shape="1", dtype="int32", usage="scalar")
 
     pipeline_cli.add_op(
         pipeline,
-        "scenegraph_visibility",
-        inputs=["scene"],
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+        inputs=["scene", "visible"],
         outputs=[],
-        attrs=["false"],
     )
     pipeline_cli.add_op(
         pipeline,
-        "update_component",
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
         inputs=["scene", "scale"],
         outputs=[],
         entity_path="/target",
@@ -486,20 +681,15 @@ def test_add_op_spatial_only_aliases_write_sdk_fields(tmp_path):
 
     operators = _read_json(pipeline)["operators"]
     assert operators[0] == {
-        "type": "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
-        "inputs": ["scene"],
+        "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+        "inputs": [{"tensor": "scene"}, {"tensor": "visible"}],
         "outputs": [],
-        "scenegraph": "scene",
-        "visible": False,
     }
     assert operators[1] == {
-        "type": "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
-        "inputs": ["scene", "scale"],
+        "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+        "inputs": [{"tensor": "scene"}, {"tensor": "scale"}],
         "outputs": [],
-        "scenegraph": "scene",
-        "data": "scale",
-        "entity_path": "/target",
-        "property": "Transform.Scale",
+        "attrs": ["/target:Transform.Scale"],
     }
 
 
@@ -517,13 +707,13 @@ def test_remove_op_widens_manifest_when_no_exclusive_operators_remain(tmp_path):
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(pipeline)
     pipeline_cli.add_op(
         pipeline,
-        "render_text",
-        inputs=["gltf"],
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
         outputs=[],
-        attrs=["bold#en-us#512#64", "hello"],
+        attrs=["bold#en-us#512#64"],
     )
     assert _read_json(manifest)["runtime"]["supported_modes"] == ["xr"]
 
@@ -554,16 +744,16 @@ def test_add_op_keeps_manifest_narrowed_by_mode_specific_sibling(tmp_path):
     pipeline_cli.add_tensor(neutral_pipeline, "x", shape="1,1", dtype="float32")
     pipeline_cli.add_tensor(neutral_pipeline, "y", shape="1,1", dtype="float32")
     pipeline_cli.init_pipeline(display_pipeline)
-    pipeline_cli.add_tensor(display_pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(display_pipeline)
     pipeline_cli.add_op(
         display_pipeline,
-        "render_text",
-        inputs=["gltf"],
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
         outputs=[],
-        attrs=["bold#en-us#512#64", "hello"],
+        attrs=["bold#en-us#512#64"],
     )
 
-    pipeline_cli.add_op(neutral_pipeline, "assignment", inputs=["x"], outputs=["y"])
+    pipeline_cli.add_op(neutral_pipeline, "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO", inputs=["x"], outputs=["y"])
 
     assert _read_json(manifest)["runtime"]["supported_modes"] == ["xr"]
 
@@ -582,14 +772,14 @@ def test_remove_op_validation_failure_leaves_pipeline_and_manifest_unchanged(tmp
         },
     )
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
+    _add_render_text_tensors(pipeline)
     pipeline_cli.add_tensor(pipeline, "x", shape="1,1", dtype="float32")
     pipeline_cli.add_op(
         pipeline,
-        "render_text",
-        inputs=["gltf"],
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
         outputs=[],
-        attrs=["bold#en-us#512#64", "hello"],
+        attrs=["bold#en-us#512#64"],
     )
     original_manifest = manifest.read_text(encoding="utf-8")
     spec = _read_json(pipeline)
@@ -615,21 +805,21 @@ def test_remove_op_rejects_out_of_range_index(tmp_path):
 def test_add_op_rejects_mixing_xr_and_spatial_only_operators_without_manifest(tmp_path):
     pipeline = tmp_path / "pipeline.json"
     pipeline_cli.init_pipeline(pipeline)
-    pipeline_cli.add_tensor(pipeline, "gltf", shape="1,1", dtype="uint8", usage="gltf")
-    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8")
+    _add_render_text_tensors(pipeline)
+    pipeline_cli.add_tensor(pipeline, "component", shape="1,1", dtype="uint8", usage="gltf")
     pipeline_cli.add_tensor(pipeline, "data", shape="1,1", dtype="float32")
     pipeline_cli.add_op(
         pipeline,
-        "render_text",
-        inputs=["gltf"],
+        "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+        inputs=_render_text_inputs(),
         outputs=[],
-        attrs=["bold#en-us#512#64", "hello"],
+        attrs=["bold#en-us#512#64"],
     )
 
     with pytest.raises(pipeline_cli.PipelineCliError, match="mix XR-only and Spatial-only"):
         pipeline_cli.add_op(
             pipeline,
-            "update_component",
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
             inputs=["component", "data"],
             outputs=[],
             entity_path="/target",
@@ -646,7 +836,7 @@ def test_add_op_model_requires_tflite_and_writes_inline_metadata(tmp_path):
     with pytest.raises(pipeline_cli.PipelineCliError, match=".tflite"):
         pipeline_cli.add_op(
             pipeline,
-            "run_model_inference",
+            "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
             inputs=["input"],
             outputs=["output"],
             model="model/demo.bin",
@@ -654,7 +844,7 @@ def test_add_op_model_requires_tflite_and_writes_inline_metadata(tmp_path):
 
     pipeline_cli.add_op(
         pipeline,
-        "run_model_inference",
+        "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
         inputs=["input"],
         outputs=["output"],
         model="model/demo.tflite",
@@ -664,14 +854,40 @@ def test_add_op_model_requires_tflite_and_writes_inline_metadata(tmp_path):
     )
 
     op = _read_json(pipeline)["operators"][0]
-    assert op["model_type"] == "tflite"
-    assert op["model_target"] == "cpu"
-    assert op["cpu_target_num_threads"] == 4
     assert op["model"]["bin_path"] == "model/demo.tflite"
     assert op["model"]["model_name"] == "demo"
+    assert op["model"]["model_type"] == "tflite"
+    assert op["model"]["model_target"] == "cpu"
+    assert op["model"]["cpu_target_num_threads"] == 4
+    assert op["model"]["input"] == [{"name": "input", "shape": [1, 4], "encoding_type": "FP32"}]
+    assert op["model"]["output"] == [{"name": "output", "shape": [1, 2], "encoding_type": "FP32"}]
+    assert "model_type" not in op
+    assert "model_target" not in op
+    assert "cpu_target_num_threads" not in op
     assert "model_file" not in op
     assert "model_asset" not in op
     assert "model_id" not in op
+
+
+def test_add_op_model_preserves_model_io_aliases(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    pipeline_cli.init_pipeline(pipeline)
+    pipeline_cli.add_tensor(pipeline, "image_tensor", shape="1,224,224,3", dtype="float32", is_input=True)
+    pipeline_cli.add_tensor(pipeline, "scores_tensor", shape="1,10", dtype="float32", is_output=True)
+
+    pipeline_cli.add_op(
+        pipeline,
+        "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
+        inputs=[{"tensor": "image_tensor", "name": "input_0"}],
+        outputs=[{"tensor": "scores_tensor", "name": "output_0"}],
+        model="model/demo.tflite",
+    )
+
+    model = _read_json(pipeline)["operators"][0]["model"]
+    assert model["input"][0]["name"] == "input_0"
+    assert model["output"][0]["name"] == "output_0"
+    assert model["input"][0]["encoding_type"] == "FP32"
+    assert model["output"][0]["encoding_type"] == "FP32"
 
 
 def test_set_input_and_set_output_mark_placeholders(tmp_path):
@@ -745,7 +961,7 @@ def test_trace_pipeline_writes_converted_spec(tmp_path):
     spec = _read_json(output)
     assert spec["inputs"] == ["x"]
     assert spec["outputs"] == ["y"]
-    assert spec["operators"][0]["expression"] == "{0} * 2.0"
+    assert spec["operators"][0]["attrs"] == ["{0} * 2.0"]
 
 
 def test_trace_pipeline_requires_trace_decorator_and_input_files(tmp_path):

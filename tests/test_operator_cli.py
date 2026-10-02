@@ -13,26 +13,29 @@ def test_discover_operators_includes_arithmetic_and_model():
     assert by_name["ARITHMETIC_COMPOSE"].creator == "arithmetic"
     assert by_name["ARITHMETIC_COMPOSE"].supported
     assert "expression" in by_name["ARITHMETIC_COMPOSE"].signature
-    assert by_name["RUN_MODEL_INFERENCE"].creator == "run_model_inference"
+    assert by_name["RUN_MODEL_INFERENCE"].creator == "run_algorithm"
     assert by_name["RUN_MODEL_INFERENCE"].supported
-
-
-def test_discover_operators_marks_custom_handler_only_features():
-    operators = {item.enum_name: item for item in operator_cli.discover_operators()}
-    for name in (
-        "CAMERA_SPACE_TO_WORLD", "LOAD_TEXTURE", "SWITCH_GLTF_RENDER_STATUS",
-        "UPDATE_GLTF", "RENDER_TEXT",
-    ):
-        assert operators[name].supported
-        assert not operators[name].native_default_loader_supported
-        assert operators[name].requires_custom_handler
+    assert by_name["MICROPHONE"].output_switches == ("--stereo-audio", "--timestamp")
 
 
 def test_find_operator_accepts_enum_type_and_creator_names():
     assert operator_cli.find_operator("ARITHMETIC_COMPOSE").creator == "arithmetic"
     assert operator_cli.find_operator("XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO").creator == "arithmetic"
-    assert operator_cli.find_operator("arithmetic").enum_name == "ARITHMETIC_COMPOSE"
     assert operator_cli.find_operator("missing") is None
+
+
+def test_operator_discovery_exposes_canonical_schema_names():
+    operators = operator_cli.discover_operators()
+
+    names = {item.enum_name for item in operators}
+    assert {
+        "MAKE_TRANSFORM_MAT",
+        "CHW_HWC",
+        "UPLOAD_TEXTURE_TO_GLTF",
+        "SSMR_SWITCH_VISIBILITY",
+        "SSMR_UPDATE_COMPONENT",
+        "JS_SCRIPTING",
+    } <= names
 
 
 def test_list_operators_human_output(capsys):
@@ -54,7 +57,7 @@ def test_list_operators_json_output(capsys):
 
 
 def test_describe_operator_outputs_details(capsys):
-    assert operator_cli.describe_operator("assignment") == 0
+    assert operator_cli.describe_operator("XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO") == 0
 
     captured = capsys.readouterr()
     assert "Operator: ASSIGNMENT" in captured.out
@@ -62,19 +65,12 @@ def test_describe_operator_outputs_details(capsys):
     assert "Signature: assignment" in captured.out
 
 
-def test_describe_operator_reports_package_portability(capsys):
-    assert operator_cli.describe_operator("render_text") == 0
-    captured = capsys.readouterr()
-    assert "Native default loader supported: no" in captured.out
-    assert "Requires downstream custom handler: yes" in captured.out
-
-
 def test_describe_operator_json_output(capsys):
-    assert operator_cli.describe_operator("run_model_inference", as_json=True) == 0
+    assert operator_cli.describe_operator("XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO", as_json=True) == 0
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["enum_name"] == "RUN_MODEL_INFERENCE"
-    assert payload["creator"] == "run_model_inference"
+    assert payload["creator"] == "run_algorithm"
 
 
 def test_describe_operator_rejects_unknown():

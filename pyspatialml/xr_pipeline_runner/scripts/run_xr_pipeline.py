@@ -46,8 +46,63 @@ RUNNER_LOG_SAMPLE = "pySpatialML XR runner"
 BENIGN_READBACK_LOG_TOKENS = ("ackreadbacktensorcontent", "invalid parameter", "no shared memory")
 
 
+def resolve_package_path(package_root: Path, value: str, *, label: str) -> Path:
+    """Resolve a schema package path without allowing host-path escapes."""
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"{label} must be a non-empty package-relative path")
+    normalized = value.replace("\\", "/")
+    if (normalized.startswith("/") or normalized.startswith("//") or
+            (len(normalized) >= 2 and normalized[1] == ":" and normalized[0].isalpha())):
+        raise SystemExit(f"{label} must be package-relative: {value!r}")
+    parts = normalized.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise SystemExit(f"{label} contains an invalid path component: {value!r}")
+    root = package_root.resolve()
+    resolved = (root / Path(*parts)).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise SystemExit(f"{label} escapes the package root: {value!r}") from exc
+    return resolved
+
+
+def validate_package_paths(package_dir: Path) -> None:
+    manifest_path = package_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Unable to read package manifest: {manifest_path}") from exc
+    pipelines = manifest.get("pipelines")
+    if not isinstance(pipelines, list):
+        raise SystemExit("Package manifest pipelines must be an array")
+    for index, entry in enumerate(pipelines):
+        if not isinstance(entry, dict):
+            raise SystemExit(f"Package manifest pipelines[{index}] must be an object")
+        pipeline_path = resolve_package_path(package_dir, entry.get("path"), label=f"manifest pipelines[{index}].path")
+        if not pipeline_path.is_file():
+            raise SystemExit(f"Manifest pipeline does not exist: {entry.get('path')!r}")
+        try:
+            pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Unable to read pipeline: {pipeline_path}") from exc
+        for op_index, operator in enumerate(pipeline.get("operators", [])):
+            if not isinstance(operator, dict):
+                continue
+            model = operator.get("model")
+            if isinstance(model, dict) and "bin_path" in model:
+                resolve_package_path(package_dir, model["bin_path"],
+                                     label=f"pipeline operator {op_index} model.bin_path")
+        tensors = pipeline.get("tensors", {})
+        if isinstance(tensors, dict):
+            for tensor_name, tensor in tensors.items():
+                if isinstance(tensor, dict) and "asset" in tensor:
+                    resolve_package_path(package_dir, tensor["asset"],
+                                         label=f"pipeline tensor {tensor_name!r} asset")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    args.pipeline = normalize_pipeline_ids(args.pipeline)
     package_root = Path(__file__).resolve().parents[2]
     packaged_apk = package_root / "apks" / "pyspatialml_xr_runner-debug.apk"
     apk = args.apk or packaged_apk
@@ -58,9 +113,11 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="pyspatialml-xr-package-") as tmp:
         tmp_root = Path(tmp)
         package_dir = prepare_package(args.package, tmp_root)
+        validate_package_paths(package_dir)
         package_dir = filter_package_pipelines(package_dir, args.pipeline or [], tmp_root)
         package_dir = strip_unused_gltf_outputs(package_dir, tmp_root)
         package_dir = override_model_backend(package_dir, args.backend, tmp_root)
+        model_backends = collect_model_backends(package_dir)
         adb = adb_prefix(args.device)
 
         ensure_apk_installed(adb, apk)
@@ -82,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         setprop(adb, "package", APP_PACKAGE)
         setprop(adb, "output", APP_OUTPUT)
         setprop(adb, "input", input_remote)
-        setprop(adb, "use_vst", "true" if args.use_vst else "false")
+        setprop(adb, "use_vst", "true" if should_use_vst(args.input, args.use_vst) else "false")
         setprop(adb, "loop", "true" if args.loop else "false")
         setprop(adb, "dump_all", "true" if dump_all(args.dump or []) else "false")
         setprop(adb, "interval_ms", str(args.interval_ms))
@@ -101,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             local_outputs = pull_app_outputs(adb, output_dir)
             print(f"Pulled outputs to {local_outputs}")
-            print_device_summary(adb, local_outputs)
+            print_device_summary(adb, local_outputs, model_backends=model_backends)
         finally:
             if args.loop and not args.keep_running:
                 run(adb + ["shell", "am", "force-stop", PACKAGE_NAME], check=False)
@@ -128,7 +185,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--loop", action="store_true", help="Run the pipeline repeatedly")
     parser.add_argument("--keep-running", action="store_true", help="Leave the runner app running after wait")
-    parser.add_argument("--use-vst", action="store_true", help="Use device VST instead of supplied image/raw input")
+    parser.add_argument("--use-vst", action="store_true", help="Use device VST; this is the default when no --input is supplied")
     parser.add_argument("--backend", choices=["npu", "gpu", "cpu"], help="Override run-model backend in staged package")
     parser.add_argument("--interval-ms", type=int, default=50, help="Loop interval in milliseconds")
     parser.add_argument("--apk", type=Path, help="Runner APK path")
@@ -136,11 +193,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def normalize_pipeline_ids(values: list[str] | None) -> list[str]:
+    """Drop empty optional selections before filtering or setting properties."""
+    return [value.strip() for value in (values or []) if value.strip()]
+
+
 def dump_all(dumps: list[str]) -> bool:
     unsupported = [item for item in dumps if str(item).lower() != "all"]
     if unsupported:
         raise SystemExit(f"Device run only supports --dump all, got: {', '.join(unsupported)}")
     return any(str(item).lower() == "all" for item in dumps)
+
+
+def should_use_vst(input_args: list[str] | None, requested: bool) -> bool:
+    """Use device VST unless raw/image input was supplied explicitly."""
+    return requested or not input_args
 
 
 def prepare_package(package: Path, tmp_root: Path) -> Path:
@@ -208,6 +275,8 @@ def filter_package_pipelines(package_dir: Path, pipeline_ids: list[str], tmp_roo
         available = ", ".join(str(item.get("id")) for item in pipelines if isinstance(item, dict))
         raise SystemExit(f"Pipeline not found: {', '.join(missing)}. Available: {available}")
 
+    for item in selected:
+        resolve_package_path(filtered_root, item.get("path"), label="manifest pipeline path")
     manifest["pipelines"] = selected
     with open(manifest_path, "w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2)
@@ -227,7 +296,7 @@ def strip_unused_gltf_outputs(package_dir: Path, tmp_root: Path) -> Path:
     for item in pipelines:
         if not isinstance(item, dict) or not item.get("path"):
             continue
-        pipeline_path = package_dir / str(item["path"])
+        pipeline_path = resolve_package_path(package_dir, item["path"], label="manifest pipeline path")
         if not pipeline_path.is_file():
             continue
         with open(pipeline_path, "r", encoding="utf-8") as file:
@@ -270,7 +339,7 @@ def override_model_backend(package_dir: Path, backend: str | None, tmp_root: Pat
     for item in pipelines:
         if not isinstance(item, dict) or not item.get("path"):
             continue
-        pipeline_path = package_dir / str(item["path"])
+        pipeline_path = resolve_package_path(package_dir, item["path"], label="manifest pipeline path")
         if not pipeline_path.is_file():
             continue
         with open(pipeline_path, "r", encoding="utf-8") as file:
@@ -291,17 +360,48 @@ def override_pipeline_model_backend(spec: dict, backend: str) -> int:
     for op in operators:
         if not isinstance(op, dict) or not is_model_operator(op):
             continue
-        op["model_target"] = backend
         model = op.get("model")
         if isinstance(model, dict):
             model["model_target"] = backend
-        changed += 1
+            changed += 1
     return changed
 
 
 def is_model_operator(op: dict) -> bool:
-    op_type = str(op.get("type") or op.get("operator_type") or "").lower()
-    return "run_model_inference" in op_type or "run_algorithm" in op_type
+    return op.get("type") == "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO"
+
+
+def collect_model_backends(package_dir: Path) -> list[str]:
+    """Read effective model targets from the finalized staged package."""
+    try:
+        manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    pipelines = manifest.get("pipelines")
+    if not isinstance(pipelines, list):
+        return []
+
+    backends = []
+    for item in pipelines:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        pipeline_path = resolve_package_path(package_dir, str(item["path"]), label="manifest pipeline path")
+        if not pipeline_path.is_file():
+            continue
+        try:
+            spec = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for op in spec.get("operators", []):
+            if not isinstance(op, dict) or not is_model_operator(op):
+                continue
+            model = op.get("model")
+            if not isinstance(model, dict):
+                continue
+            backend = str(model.get("model_target") or "npu").strip().lower()
+            if backend and backend not in backends:
+                backends.append(backend)
+    return backends
 
 
 def ensure_mutable_package(package_dir: Path, tmp_root: Path) -> Path:
@@ -565,7 +665,12 @@ def pull_remote_status(adb: list[str], files: list[str]) -> dict:
     return {}
 
 
-def print_device_summary(adb: list[str], local_outputs: Path) -> None:
+def print_device_summary(
+    adb: list[str],
+    local_outputs: Path,
+    *,
+    model_backends: list[str] | None = None,
+) -> None:
     status_path = local_outputs / "status.json"
     status = {}
     if status_path.is_file():
@@ -586,6 +691,7 @@ def print_device_summary(adb: list[str], local_outputs: Path) -> None:
         print(f"  Runtime modes: {runtime_modes}")
         pipelines = ", ".join(str(item) for item in status.get("pipelines", [])) or "-"
         print(f"  Pipelines: {pipelines}")
+        print(f"  Backend: {', '.join(model_backends or []) or '-'}")
         print(f"  Iteration: {status.get('iteration', '-')}")
         print(f"  Total time: {format_ms(status.get('total_elapsed_ms'))}")
         print(f"  Loop: {str(status.get('loop', '-')).lower()}")
@@ -757,24 +863,29 @@ def collect_relevant_logs(adb: list[str]) -> list[str]:
         r"(\s[VDIWEF]\s+(litert|tflite)\s*:|LiteRT|LiteRt|TFLite|tflite|"
         r"compiler_plugin|libLiteRtCompilerPlugin|LiteRtDispatch)"
     )
-    securemr_pattern = re.compile(rf"({re.escape(SECUREMR_LOG_TAG_SAMPLE)}|OperatorRunModelInference)")
+    securemr_pattern = re.compile(re.escape(SECUREMR_LOG_TAG_SAMPLE))
     runner_pattern = re.compile(rf"({re.escape(RUNNER_LOG_SAMPLE)}|OpenMR:)")
     litert_lines = []
     securemr_lines = []
     runner_lines = []
     output = result.stdout.decode("utf-8", errors="replace")
     for line in output.splitlines():
+        # SecureMR owns the authoritative pipeline and inference errors. Keep
+        # every line from that tag, including messages that would otherwise
+        # match the benign readback filter, so early failures are not hidden
+        # by later teardown or rendering logs.
+        if securemr_pattern.search(line):
+            securemr_lines.append(line)
+            continue
         if is_benign_readback_log(line):
             continue
         if litert_pattern.search(line):
             litert_lines.append(line)
-        elif securemr_pattern.search(line):
-            securemr_lines.append(line)
         elif runner_pattern.search(line):
             runner_lines.append(line)
     return (
         select_litert_logs(litert_lines, 24)
-        + tail_unique(securemr_lines, 16)
+        + securemr_lines
         + tail_unique(runner_lines, 12)
     )
 

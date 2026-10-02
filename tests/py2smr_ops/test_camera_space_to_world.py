@@ -59,7 +59,7 @@ class TestCameraSpaceToWorld:
         np.testing.assert_allclose(result[1], expected_left, rtol=1e-5, atol=1e-5)
 
         spec = convert(ctx)
-        assert spec["operators"][0]["outputs"] == ["right", "left"]
+        assert spec["operators"][0]["outputs"] == [{"tensor": "right"}, {"tensor": "left"}]
         verification = verify(
             pipeline=spec,
             inputs={"timestamp": timestamp},

@@ -28,7 +28,14 @@ import numpy as np
 from securemr.core.types import EDataType
 from securemr.core.utils import mat_flag
 from securemr.py2smr import convert
-from securemr.py2smr.verifier import validate_pipeline_spec
+from securemr.py2smr.verifier import validate_microphone_attrs, validate_pipeline_spec
+from securemr.operator_contracts import (
+    OPERATOR_ARITIES,
+    SPATIAL_ONLY_OPERATORS,
+    XR_ONLY_OPERATORS,
+    operator_contract,
+    package_operator_name,
+)
 
 
 class PipelineCliError(RuntimeError):
@@ -73,86 +80,28 @@ _USAGE_ALIASES = {
     "gltf": 7,
 }
 
-_OP_ALIASES = {
-    "arithmetic": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-    "assignment": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-    "camera_access": "XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO",
-    "cam_space_to_xr_local": "XR_SECURE_MR_OPERATOR_TYPE_CAMERA_SPACE_TO_WORLD_PICO",
-    "camera_space_to_world": "XR_SECURE_MR_OPERATOR_TYPE_CAMERA_SPACE_TO_WORLD_PICO",
-    "compare_to": "XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO",
-    "cvt_color": "XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO",
-    "draw_text": "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
-    "get_transform_mat": "XR_SECURE_MR_OPERATOR_TYPE_GET_TRANSFORM_MAT_PICO",
-    "make_transform_mat": "XR_SECURE_MR_OPERATOR_TYPE_GET_TRANSFORM_MAT_PICO",
-    "render_gltf": "XR_SECURE_MR_OPERATOR_TYPE_SWITCH_GLTF_RENDER_STATUS_PICO",
-    "run_model_inference": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-    "run_algorithm": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-    "solve_pnp": "XR_SECURE_MR_OPERATOR_TYPE_SOLVE_P_N_P_PICO",
-    "sort_matrix": "XR_SECURE_MR_OPERATOR_TYPE_SORT_MAT_PICO",
-    "sort_vector": "XR_SECURE_MR_OPERATOR_TYPE_SORT_VEC_PICO",
-    "scenegraph_visibility": "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
-    "type_convert": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-    "update_component": "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
-    "upload_texture_to_gltf": "XR_SECURE_MR_OPERATOR_TYPE_LOAD_TEXTURE_PICO",
-    "uv2_cam": "XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO",
-    "uv_to_3d": "XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO",
-    "uv_to_3d_in_camera_space": "XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO",
+_LEGACY_OPERATOR_FIELDS = {
+    "comparison",
+    "config",
+    "flag",
+    "mode",
+    "model_asset",
+    "model_file",
+    "model_id",
+    "model_name",
+    "model_target",
+    "model_type",
+    "cpu_target_num_threads",
+    "normalize_type",
+    "script",
+    "target_property",
+    "text",
+    "threshold",
+    "update_type",
+    "visible",
 }
-_OP_SCENEGRAPH_VISIBILITY = _OP_ALIASES["scenegraph_visibility"]
-_OP_UPDATE_COMPONENT = _OP_ALIASES["update_component"]
-_XR_ONLY_OPERATORS = {
-    "LOAD_TEXTURE",
-    "RENDER_TEXT",
-    "SWITCH_GLTF_RENDER_STATUS",
-    "UPDATE_GLTF",
-}
-_SPATIAL_ONLY_OPERATORS = {
-    "SCENEGRAPH_VISIBILITY",
-    "UPDATE_COMPONENT",
-}
-
-_OP_ARITY: Mapping[str, tuple[int, Optional[int], int, Optional[int]]] = {
-    "UNKNOWN": (1, 1, 1, 1),
-    "ARITHMETIC_COMPOSE": (1, None, 1, 1),
-    "ELEMENTWISE_MIN": (2, 2, 1, 1),
-    "ELEMENTWISE_MAX": (2, 2, 1, 1),
-    "ELEMENTWISE_MULTIPLY": (2, 2, 1, 1),
-    "CUSTOMIZED_COMPARE": (2, 2, 1, 1),
-    "ELEMENTWISE_OR": (2, 2, 1, 1),
-    "ELEMENTWISE_AND": (2, 2, 1, 1),
-    "ALL": (1, 1, 1, 1),
-    "ANY": (1, 1, 1, 1),
-    "NMS": (2, 2, 1, 3),
-    "SOLVE_P_N_P": (3, 3, 1, 2),
-    "GET_AFFINE": (2, 2, 1, 1),
-    "APPLY_AFFINE": (2, 2, 1, 1),
-    "APPLY_AFFINE_POINT": (2, 2, 1, 1),
-    "UV_TO_3D_IN_CAM_SPACE": (5, 5, 1, 1),
-    "ASSIGNMENT": (1, 2, 1, 1),
-    "RUN_MODEL_INFERENCE": (1, None, 1, None),
-    "NORMALIZE": (1, 2, 1, 1),
-    "CAMERA_SPACE_TO_WORLD": (1, 1, 1, 2),
-    "RECTIFIED_VST_ACCESS": (0, 0, 1, 4),
-    "ARGMAX": (1, 1, 1, 1),
-    "CONVERT_COLOR": (1, 1, 1, 1),
-    "SORT_VEC": (1, 1, 1, 2),
-    "INVERSION": (1, 1, 1, 1),
-    "GET_TRANSFORM_MAT": (2, 3, 1, 1),
-    "SORT_MAT": (1, 1, 1, 2),
-    "SWITCH_GLTF_RENDER_STATUS": (1, 4, 0, 0),
-    "UPDATE_GLTF": (1, 3, 0, 0),
-    "RENDER_TEXT": (1, 5, 0, 0),
-    "LOAD_TEXTURE": (2, 2, 1, 1),
-    "SVD": (1, 1, 1, 3),
-    "NORM": (1, 1, 1, 1),
-    "SWAP_HWC_CHW": (1, 1, 1, 1),
-    "SCENEGRAPH_VISIBILITY": (1, 2, 0, 0),
-    "UPDATE_COMPONENT": (1, 2, 0, 0),
-    "JAVASCRIPT": (0, None, 1, None),
-    "MICROPHONE": (0, 0, 1, 2),
-    "SPEAKER": (1, 1, 0, 0),
-    "DEPTH": (0, 0, 1, 1),
-}
+_XR_ONLY_OPERATORS = XR_ONLY_OPERATORS
+_SPATIAL_ONLY_OPERATORS = SPATIAL_ONLY_OPERATORS
 
 
 def init_pipeline(path: Path, *, force: bool = False) -> int:
@@ -172,6 +121,7 @@ def add_tensor(
     shape: str,
     dtype: str,
     usage: str = "matrix",
+    channels: Optional[int] = None,
     is_input: bool = False,
     is_output: bool = False,
     value: Optional[str] = None,
@@ -183,9 +133,25 @@ def add_tensor(
     if name in tensors:
         raise PipelineCliError(f"Tensor already exists: {name}")
 
-    dimensions, channels = _shape_to_dimensions_and_channels(_parse_int_list(shape))
-    data_type = _schema_dtype(dtype)
+    parsed_shape = _parse_int_list(shape)
     usage_value = _usage_value(usage)
+    if channels is None and usage_value != _USAGE_ALIASES["matrix"]:
+        dimensions = [int(dim) for dim in parsed_shape]
+        inferred_channels = {
+            _USAGE_ALIASES["point"]: 2,
+            _USAGE_ALIASES["color"]: 4,
+            _USAGE_ALIASES["timestamp"]: 4,
+            _USAGE_ALIASES["slice"]: 2,
+        }.get(usage_value, 1)
+    else:
+        dimensions, inferred_channels = _shape_to_dimensions_and_channels(parsed_shape)
+    if channels is None:
+        channels = inferred_channels
+    else:
+        if not isinstance(channels, int) or isinstance(channels, bool) or not 1 <= channels <= 127:
+            raise PipelineCliError("Tensor channels must be an integer from 1 through 127")
+        dimensions = [int(dim) for dim in parsed_shape]
+    data_type = _schema_dtype(dtype)
     tensor_spec: dict[str, Any] = {
         "dimensions": dimensions,
         "channels": channels,
@@ -196,11 +162,10 @@ def add_tensor(
     if usage_value == _USAGE_ALIASES["matrix"]:
         tensor_spec["flag"] = mat_flag(EDataType(data_type), channels)
     if usage_value == _USAGE_ALIASES["gltf"]:
-        tensor_spec["tensor_type"] = "gltf"
         tensor_spec["is_gltf"] = True
         tensor_spec["is_placeholder"] = True
     if value is not None:
-        tensor_spec["value"] = _parse_value_list(value)
+        tensor_spec["data"] = _parse_value_list(value)
     if asset is not None:
         asset_value = asset.replace("\\", "/").lstrip("/")
         if not asset_value or any(part in {"", ".", ".."} for part in asset_value.split("/")):
@@ -221,13 +186,20 @@ def add_op(
     path: Path,
     op_type: str,
     *,
-    inputs: Sequence[str],
-    outputs: Sequence[str],
+    inputs: Sequence[Any],
+    outputs: Sequence[Any],
     attrs: Sequence[str] = (),
     expression: Optional[str] = None,
     dtype: Optional[str] = None,
     flag: Optional[str] = None,
     threshold: Optional[float] = None,
+    comparison: Optional[str] = None,
+    normalize_type: Optional[str] = None,
+    script: Optional[str] = None,
+    config: Optional[str] = None,
+    text: Optional[str] = None,
+    update_type: Optional[str] = None,
+    mode: Optional[str] = None,
     model: Optional[str] = None,
     model_name: Optional[str] = None,
     model_target: str = "npu",
@@ -235,124 +207,111 @@ def add_op(
     scenegraph: Optional[str] = None,
     entity_path: Optional[str] = None,
     property: Optional[str] = None,
+    target_property: Optional[str] = None,
     data: Optional[str] = None,
     src_slices: Any = None,
     dst_slices: Any = None,
-    src_slices_tensor: Optional[str] = None,
-    dst_slices_tensor: Optional[str] = None,
     src_channel_slice: Any = None,
     dst_channel_slice: Any = None,
-    src_points: Any = None,
-    dst_points: Any = None,
 ) -> int:
     """Append an operator to a pipeline."""
     spec = _load_pipeline(path)
     tensors = _tensors(spec)
     normalized_op_type = _operator_type(op_type)
-    effective_inputs = list(inputs)
+    if _operator_enum_name(normalized_op_type) not in OPERATOR_ARITIES:
+        raise PipelineCliError(f"Unsupported operator type: {op_type}")
+    effective_inputs = [_normalize_tensor_ref(ref) for ref in inputs]
+    effective_outputs = [_normalize_tensor_ref(ref) for ref in outputs]
     op_name = _operator_enum_name(normalized_op_type)
-    if op_name in {"SCENEGRAPH_VISIBILITY", "UPDATE_COMPONENT"} and scenegraph:
+    if op_name in {"SSMR_SWITCH_VISIBILITY", "SSMR_UPDATE_COMPONENT"} and scenegraph:
         if not effective_inputs:
-            effective_inputs.append(scenegraph)
-        elif effective_inputs[0] != scenegraph:
+            effective_inputs.append(_tensor_ref(scenegraph))
+        elif _resolve_ref_name(effective_inputs[0]) != scenegraph:
             raise PipelineCliError(
                 f"{op_name.lower()} --scenegraph must match the first --input tensor"
             )
-    if op_name == "UPDATE_COMPONENT" and data and data not in effective_inputs:
-        effective_inputs.append(data)
-    referenced_names = list(effective_inputs) + list(outputs)
-    for extra_name in (src_slices_tensor, dst_slices_tensor):
-        if extra_name:
-            referenced_names.append(extra_name)
+    if op_name == "SSMR_UPDATE_COMPONENT" and data and data not in {_resolve_ref_name(ref) for ref in effective_inputs}:
+        effective_inputs.append(_tensor_ref(data))
+    effective_property = property or target_property
+    referenced_names = [_resolve_ref_name(ref) for ref in [*effective_inputs, *effective_outputs]]
     for tensor_name in referenced_names:
         if tensor_name and tensor_name not in tensors:
             raise PipelineCliError(f"Unknown tensor referenced by operator: {tensor_name}")
 
+    effective_inputs, effective_outputs = _normalize_operator_refs_for_arity(
+        normalized_op_type,
+        inputs=effective_inputs,
+        outputs=effective_outputs,
+    )
     _validate_operator_arity(
         normalized_op_type,
         inputs=effective_inputs,
-        outputs=outputs,
-        has_inline_affine_points=src_points is not None or dst_points is not None,
+        outputs=effective_outputs,
     )
-    if normalized_op_type == _OP_ALIASES["arithmetic"] and not expression:
+    if op_name == "ARITHMETIC_COMPOSE" and not expression and not attrs:
         raise PipelineCliError("Arithmetic operators require --expression")
+    canonical_attrs = _canonical_attrs(
+        op_name,
+        attrs=attrs,
+        expression=expression,
+        flag=flag,
+        threshold=threshold,
+        comparison=comparison,
+        normalize_type=normalize_type,
+        script=script,
+        config=config,
+        text=text,
+        update_type=update_type,
+        mode=mode,
+        entity_path=entity_path,
+        property=effective_property,
+    )
     _validate_required_operator_metadata(
         normalized_op_type,
-        inputs=effective_inputs,
-        attrs=attrs,
-        flag=flag,
+        attrs=canonical_attrs,
         model=model,
     )
     _validate_structured_operator_fields(
         normalized_op_type,
         inputs=effective_inputs,
-        outputs=outputs,
+        outputs=effective_outputs,
         scenegraph=scenegraph,
         entity_path=entity_path,
-        property=property,
+        property=effective_property,
+        target_property=target_property,
         data=data,
-        src_points=src_points,
-        dst_points=dst_points,
         src_slices=src_slices,
         dst_slices=dst_slices,
-        src_slices_tensor=src_slices_tensor,
-        dst_slices_tensor=dst_slices_tensor,
     )
 
     op = {
         "type": normalized_op_type,
         "inputs": effective_inputs,
-        "outputs": list(outputs),
+        "outputs": effective_outputs,
     }
-    if attrs:
-        op["attrs"] = list(attrs)
-    if expression is not None:
-        op["expression"] = expression
-    if dtype is not None:
-        op["data_type"] = _schema_dtype(dtype)
-    if flag is not None:
-        op["flag"] = _parse_int(flag)
-    if threshold is not None:
-        op["threshold"] = float(threshold)
+    if canonical_attrs:
+        op["attrs"] = canonical_attrs
     if model is not None:
         if not model_name:
             model_name = Path(model).stem or "model"
-        op["model_type"] = "tflite"
-        op["model_target"] = model_target
-        op["cpu_target_num_threads"] = int(cpu_target_num_threads)
-        op["model_name"] = model_name
         op["model"] = {
             "bin_path": _normalize_model_path(model),
             "model_name": model_name,
             "model_type": "tflite",
             "model_target": model_target,
-            "cpu_target_num_threads": int(cpu_target_num_threads),
+            "input": _model_io_metadata(effective_inputs, tensors),
+            "output": _model_io_metadata(effective_outputs, tensors),
         }
+        if model_target.lower() == "cpu":
+            op["model"]["cpu_target_num_threads"] = int(cpu_target_num_threads)
     if src_slices is not None:
         op["src_slices"] = _parse_structured_list(src_slices, "src_slices")
     if dst_slices is not None:
         op["dst_slices"] = _parse_structured_list(dst_slices, "dst_slices")
-    if src_slices_tensor is not None:
-        op["src_slices_tensor"] = src_slices_tensor
-    if dst_slices_tensor is not None:
-        op["dst_slices_tensor"] = dst_slices_tensor
     if src_channel_slice is not None:
         op["src_channel_slice"] = _parse_structured_list(src_channel_slice, "src_channel_slice")
     if dst_channel_slice is not None:
         op["dst_channel_slice"] = _parse_structured_list(dst_channel_slice, "dst_channel_slice")
-    if src_points is not None:
-        op["src_points"] = _parse_structured_list(src_points, "src_points")
-    if dst_points is not None:
-        op["dst_points"] = _parse_structured_list(dst_points, "dst_points")
-    _apply_spatial_operator_fields(
-        op,
-        attrs,
-        scenegraph=scenegraph,
-        entity_path=entity_path,
-        property=property,
-        data=data,
-    )
-    _apply_xr_rendering_fields(op, attrs)
 
     spec.setdefault("operators", []).append(op)
     _validate_and_write_operator_update(path, spec)
@@ -372,7 +331,7 @@ def remove_op(path: Path, index: int) -> int:
     if not isinstance(removed, Mapping):
         removed_type = "<invalid>"
     else:
-        removed_type = str(removed.get("type") or removed.get("operator_type") or "<unknown>")
+        removed_type = str(removed.get("type") or "<unknown>")
     _validate_and_write_operator_update(path, spec)
     print(f"Removed operator #{index}: {removed_type}")
     return 0
@@ -399,7 +358,6 @@ def remove_tensor(path: Path, name: str, *, force: bool = False) -> int:
         if isinstance(values, list):
             spec[key] = [value for value in values if value != name]
     if force and references:
-        validate_pipeline_spec(dict(spec))
         _write_json(path, spec)
     else:
         _validate_and_write(path, spec)
@@ -413,15 +371,16 @@ def remove_tensor(path: Path, name: str, *, force: bool = False) -> int:
 def _validate_operator_arity(
     op_type: str,
     *,
-    inputs: Sequence[str],
-    outputs: Sequence[str],
+    inputs: Sequence[Any],
+    outputs: Sequence[Any],
     has_inline_affine_points: bool = False,
 ) -> None:
     op_name = _operator_enum_name(op_type)
-    arity = _OP_ARITY.get(op_name)
-    if arity is None:
+    contract = operator_contract(op_name)
+    if contract is None:
         return
-    min_inputs, max_inputs, min_outputs, max_outputs = arity
+    arity = contract.builder_arity
+    min_inputs, max_inputs, min_outputs, max_outputs, nullable_inputs, nullable_outputs = arity
     if op_name == "GET_AFFINE" and has_inline_affine_points:
         min_inputs = max_inputs = 0
     _validate_count(
@@ -438,6 +397,64 @@ def _validate_operator_arity(
         minimum=min_outputs,
         maximum=max_outputs,
     )
+    _validate_non_nullable_slots(op_name, "input", inputs, nullable_inputs)
+    _validate_non_nullable_slots(op_name, "output", outputs, nullable_outputs)
+
+
+def _normalize_operator_refs_for_arity(
+    op_type: str,
+    *,
+    inputs: Sequence[Any],
+    outputs: Sequence[Any],
+) -> tuple[list[Any], list[Any]]:
+    op_name = _operator_enum_name(op_type)
+    contract = operator_contract(op_name)
+    if contract is None:
+        return list(inputs), list(outputs)
+    if op_name in XR_ONLY_OPERATORS:
+        arity = contract.builder_arity
+        _, max_inputs, _, max_outputs, nullable_inputs, nullable_outputs = arity
+        return (
+            _pad_nullable_refs(list(inputs), max_inputs, nullable_inputs),
+            _pad_nullable_refs(list(outputs), max_outputs, nullable_outputs),
+        )
+    return _trim_trailing_null_refs(list(inputs)), _trim_trailing_null_refs(list(outputs))
+
+
+def _pad_nullable_refs(
+    refs: list[Any], maximum: Optional[int], nullable_slots: set[int]
+) -> list[Any]:
+    if maximum is None:
+        return refs
+    for index in range(len(refs), maximum):
+        if index in nullable_slots:
+            refs.append(None)
+    return refs
+
+
+def _trim_trailing_null_refs(refs: list[Any]) -> list[Any]:
+    """Use the dense schema-v2 form accepted by the current SpatialSDK loader."""
+    while refs and _resolve_ref_name(refs[-1]) is None:
+        refs.pop()
+    if any(_resolve_ref_name(ref) is None for ref in refs):
+        raise PipelineCliError(
+            "Schema v2 cannot represent an omitted operator slot before a later "
+            "connected slot; connect the earlier slot or omit all following slots"
+        )
+    return refs
+
+
+def _validate_non_nullable_slots(
+    op_name: str,
+    label: str,
+    refs: Sequence[Any],
+    nullable_slots: set[int],
+) -> None:
+    for index, ref in enumerate(refs):
+        if _resolve_ref_name(ref) is None and index not in nullable_slots:
+            raise PipelineCliError(
+                f"{op_name.lower()} operators do not allow null {label} slot {index}"
+            )
 
 
 def _validate_count(
@@ -466,40 +483,33 @@ def _format_count_range(minimum: int, maximum: Optional[int]) -> str:
 def _validate_required_operator_metadata(
     op_type: str,
     *,
-    inputs: Sequence[str],
     attrs: Sequence[str],
-    flag: Optional[str],
     model: Optional[str],
 ) -> None:
-    if op_type.endswith("CONVERT_COLOR_PICO") and flag is None and not attrs:
-        raise PipelineCliError("convert_color operators require --flag")
-    if op_type.endswith("CUSTOMIZED_COMPARE_PICO") and not attrs:
-        raise PipelineCliError("customized_compare operators require --attr with a compare operator")
-    if op_type.endswith("JAVASCRIPT_PICO") and not attrs:
-        raise PipelineCliError("javascript operators require --attr with JavaScript code")
-    if op_type.endswith("RENDER_TEXT_PICO") and len(attrs) < 2:
-        raise PipelineCliError(
-            "render_text operators require --attr config and --attr text"
-        )
-    if op_type.endswith("UPDATE_GLTF_PICO") and not attrs:
-        raise PipelineCliError("update_gltf operators require --attr with update type")
-    if op_type.endswith("UPDATE_GLTF_PICO") and attrs:
-        attribute = attrs[0].lower()
-        required_inputs = {
-            "texture": 3,
-            "gltf_texture": 3,
-            "animation": 2,
-            "world_pose": 2,
-            "pose": 2,
-            "local_transform": 3,
-            "local_pose": 3,
-        }.get(attribute)
-        if required_inputs is not None and len(inputs) < required_inputs:
-            raise PipelineCliError(
-                f"update_gltf {attribute} requires at least {required_inputs} input tensors"
-            )
-    if op_type == _OP_ALIASES["run_model_inference"] and model is None:
-        raise PipelineCliError("run_model_inference operators require --model")
+    op_name = _operator_enum_name(op_type)
+    if op_name == "CONVERT_COLOR" and not attrs:
+        raise PipelineCliError("CONVERT_COLOR operators require flag or attrs[0]")
+    if op_name == "CUSTOMIZED_COMPARE" and not attrs:
+        raise PipelineCliError("customized_compare operators require comparison or attrs[0]")
+    if op_name == "JS_SCRIPTING" and not attrs:
+        raise PipelineCliError("JS_SCRIPTING operators require script or attrs[0]")
+    if op_name == "RENDER_TEXT" and not attrs:
+        raise PipelineCliError("render_text operators require config or attrs[0]")
+    if op_name == "UPDATE_GLTF" and not attrs:
+        raise PipelineCliError("update_gltf operators require update_type or attrs[0]")
+    if op_name == "SSMR_UPDATE_COMPONENT" and not attrs:
+        raise PipelineCliError("update_component operators require component path in attrs[0]")
+    if op_name == "MICROPHONE" and not attrs:
+        raise PipelineCliError("microphone operators require attrs[0]")
+    if op_name == "MICROPHONE":
+        try:
+            validate_microphone_attrs(list(attrs), "microphone operators")
+        except ValueError as exc:
+            raise PipelineCliError(str(exc)) from exc
+    if op_name == "SPEAKER" and not attrs:
+        raise PipelineCliError("speaker operators require attrs[0]")
+    if _operator_enum_name(op_type) == "RUN_MODEL_INFERENCE" and model is None:
+        raise PipelineCliError("RUN_MODEL_INFERENCE operators require --model")
 
 
 def _validate_structured_operator_fields(
@@ -510,135 +520,69 @@ def _validate_structured_operator_fields(
     scenegraph: Optional[str],
     entity_path: Optional[str],
     property: Optional[str],
+    target_property: Optional[str],
     data: Optional[str],
-    src_points: Any,
-    dst_points: Any,
     src_slices: Any,
     dst_slices: Any,
-    src_slices_tensor: Optional[str],
-    dst_slices_tensor: Optional[str],
 ) -> None:
     op_name = _operator_enum_name(op_type)
-    if op_name == "GET_AFFINE" and (src_points is not None or dst_points is not None):
-        if src_points is None or dst_points is None:
-            raise PipelineCliError("get_affine requires both --src-points and --dst-points")
-    if op_name == "UPDATE_COMPONENT":
+    if op_name == "SSMR_UPDATE_COMPONENT":
         if not scenegraph and not inputs:
-            raise PipelineCliError("update_component requires --scenegraph or a first --input tensor")
-        if not entity_path:
-            raise PipelineCliError("update_component requires --entity-path")
-        if not entity_path.startswith("/"):
+            raise PipelineCliError("update_component requires --scenegraph")
+        if entity_path and not entity_path.startswith("/"):
             raise PipelineCliError("update_component entity path must start with '/'")
-        if not property:
+        if not property and not target_property:
             raise PipelineCliError("update_component requires --property")
         if not data and len(inputs) < 2:
-            raise PipelineCliError("update_component requires --data or a second --input tensor")
+            raise PipelineCliError("update_component requires --data")
         if outputs:
             raise PipelineCliError("update_component does not produce output tensors")
-    if op_name == "SCENEGRAPH_VISIBILITY":
+    if op_name == "SSMR_SWITCH_VISIBILITY":
         if not scenegraph and not inputs:
-            raise PipelineCliError("scenegraph_visibility requires --scenegraph or a first --input tensor")
-        if len(inputs) > 2:
-            raise PipelineCliError("scenegraph_visibility accepts at most two input tensors")
-    if op_name == "ASSIGNMENT":
-        if src_slices is not None and src_slices_tensor is not None:
-            raise PipelineCliError("assignment cannot combine --src-slices and --src-slices-tensor")
-        if dst_slices is not None and dst_slices_tensor is not None:
-            raise PipelineCliError("assignment cannot combine --dst-slices and --dst-slices-tensor")
+            raise PipelineCliError("scenegraph_visibility requires --scenegraph")
 
 
-def _apply_spatial_operator_fields(
-    op: dict[str, Any],
-    attrs: Sequence[str],
+def _canonical_attrs(
+    op_name: str,
     *,
-    scenegraph: Optional[str] = None,
-    entity_path: Optional[str] = None,
-    property: Optional[str] = None,
-    data: Optional[str] = None,
-) -> None:
-    if op["type"] == _OP_SCENEGRAPH_VISIBILITY:
-        if scenegraph:
-            op["scenegraph"] = scenegraph
-            if not op["inputs"]:
-                op["inputs"] = [scenegraph]
-        elif op["inputs"]:
-            op["scenegraph"] = op["inputs"][0]
-        if attrs:
-            op["visible"] = _parse_bool_or_tensor(attrs[0])
-    elif op["type"] == _OP_UPDATE_COMPONENT:
-        scene_name = scenegraph or (op["inputs"][0] if op["inputs"] else None)
-        data_name = data or (op["inputs"][1] if len(op["inputs"] ) > 1 else None)
-        if scene_name:
-            op["scenegraph"] = scene_name
-            if not op["inputs"]:
-                op["inputs"] = [scene_name]
-        if entity_path:
-            op["entity_path"] = entity_path
-        if property:
-            op["property"] = property
-        if data_name:
-            op["data"] = data_name
-            if data_name not in op["inputs"]:
-                op["inputs"].append(data_name)
-    if _operator_enum_name(op["type"]) in {"SCENEGRAPH_VISIBILITY", "UPDATE_COMPONENT"}:
-        op.pop("attrs", None)
-
-
-def _apply_xr_rendering_fields(op: dict[str, Any], attrs: Sequence[str]) -> None:
-    """Promote legacy GLTF attrs/positions to native XR named fields.
-
-    Keep ``attrs`` intact for older consumers, while making the schema-v2
-    representation directly consumable by the native XR deserializer.
-    """
-    op_name = _operator_enum_name(op["type"])
-    inputs = op.get("inputs", [])
-    if op_name == "LOAD_TEXTURE":
-        if len(inputs) >= 2:
-            op.setdefault("gltf", inputs[0])
-            op.setdefault("rgb_image", inputs[1])
-    elif op_name == "SWITCH_GLTF_RENDER_STATUS":
-        if inputs:
-            op.setdefault("gltf", inputs[0])
-        if len(inputs) > 1:
-            op.setdefault("pose", inputs[1])
-    elif op_name == "RENDER_TEXT":
-        if inputs:
-            op.setdefault("gltf", inputs[0])
-        if len(attrs) >= 2:
-            op.setdefault("config", attrs[0])
-            parts = attrs[0].split("#")
-            op.setdefault("typeface", parts[0] or "default")
-            op.setdefault("language_and_locale", parts[1] if len(parts) > 1 else "en-us")
-            if len(parts) > 2:
-                op.setdefault("canvas_width", _parse_int(parts[2]))
-            if len(parts) > 3:
-                op.setdefault("canvas_height", _parse_int(parts[3]))
-            op.setdefault("text", attrs[1])
-            op.setdefault("start", [0.0, 0.0])
-            op.setdefault("colors", [[255, 255, 255, 255], [0, 0, 0, 0]])
-            op.setdefault("texture_id", 0)
-            op.setdefault("font_size", 16.0)
-    elif op_name == "UPDATE_GLTF":
-        if inputs:
-            op.setdefault("gltf", inputs[0])
-        if attrs:
-            attribute = attrs[0]
-            op.setdefault("update_type", attribute)
-            if attribute in {"texture", "gltf_texture"} and len(inputs) >= 3:
-                op.setdefault("texture_src", inputs[1])
-                op.setdefault("texture_id", inputs[2])
-            elif attribute == "animation":
-                if len(inputs) > 1:
-                    op.setdefault("animation_id", inputs[1])
-                if len(inputs) > 2:
-                    op.setdefault("animation_timer", inputs[2])
-            elif attribute in {"world_pose", "pose"} and len(inputs) > 1:
-                op.setdefault("pose", inputs[1])
-            elif attribute in {"local_transform", "local_pose"}:
-                if len(inputs) > 1:
-                    op.setdefault("transform", inputs[1])
-                if len(inputs) > 2:
-                    op.setdefault("node_id", inputs[2])
+    attrs: Sequence[str],
+    expression: Optional[str],
+    flag: Optional[str],
+    threshold: Optional[float],
+    comparison: Optional[str],
+    normalize_type: Optional[str],
+    script: Optional[str],
+    config: Optional[str],
+    text: Optional[str],
+    update_type: Optional[str],
+    mode: Optional[str],
+    entity_path: Optional[str],
+    property: Optional[str],
+) -> list[str]:
+    values = list(attrs)
+    if op_name == "ARITHMETIC_COMPOSE" and expression is not None:
+        values = [expression]
+    elif op_name == "CONVERT_COLOR" and flag is not None:
+        values = [str(_parse_int(flag))]
+    elif op_name == "CUSTOMIZED_COMPARE" and comparison is not None:
+        values = [comparison]
+    elif op_name == "NMS" and threshold is not None:
+        values = [str(float(threshold))]
+    elif op_name in {"NORMALIZE", "NORM"} and normalize_type is not None:
+        values = [normalize_type]
+    elif op_name == "JS_SCRIPTING" and script is not None:
+        values = [script]
+    elif op_name == "RENDER_TEXT" and config is not None:
+        values = [config]
+    elif op_name == "UPDATE_GLTF" and update_type is not None:
+        values = [update_type]
+    elif op_name == "SORT_MAT" and mode is not None:
+        values = [mode]
+    elif op_name == "SSMR_UPDATE_COMPONENT" and entity_path and property:
+        values = [f"{entity_path}:{property}"]
+    if op_name == "RENDER_TEXT" and text is not None:
+        raise PipelineCliError("render_text text must be provided as input tensor, not --text")
+    return values
 
 
 def _parse_bool_or_tensor(value: str) -> Union[bool, str]:
@@ -689,8 +633,10 @@ def set_output(path: Path, names: Sequence[str]) -> int:
 def validate_pipeline(path: Path) -> int:
     """Validate a pipeline JSON file."""
     spec = _load_pipeline(path)
-    validate_pipeline_spec(spec)
-    _validate_tensor_references(spec)
+    try:
+        _validate_pipeline_update(spec)
+    except ValueError as exc:
+        raise PipelineCliError(str(exc)) from exc
     print(f"Pipeline is valid: {path}")
     return 0
 
@@ -747,7 +693,11 @@ def _set_boundary(path: Path, key: str, names: Sequence[str]) -> int:
     missing = [name for name in names if name not in tensors]
     if missing:
         raise PipelineCliError(f"Unknown tensor(s): {', '.join(missing)}")
+    previous = set(spec.get(key, [])) if isinstance(spec.get(key), list) else set()
     spec[key] = list(dict.fromkeys(names))
+    for name in previous - set(spec[key]):
+        if name in tensors and name not in set(spec.get("inputs", [])) | set(spec.get("outputs", [])):
+            tensors[name]["is_placeholder"] = False
     for name in names:
         tensors[name]["is_placeholder"] = True
     _validate_and_write(path, spec)
@@ -803,8 +753,70 @@ def _validate_and_write_operator_update(path: Path, spec: Mapping[str, Any]) -> 
 
 
 def _validate_pipeline_update(spec: Mapping[str, Any]) -> None:
-    validate_pipeline_spec(dict(spec))
     _validate_tensor_references(spec)
+    _reject_legacy_operator_fields(spec)
+    _validate_canonical_operator_specs(spec)
+    validate_pipeline_spec(spec)
+
+
+def _validate_canonical_operator_specs(spec: Mapping[str, Any]) -> None:
+    for index, op in enumerate(spec.get("operators", [])):
+        if not isinstance(op, Mapping):
+            continue
+        op_name = _operator_enum_name(str(op.get("type") or ""))
+        contract = operator_contract(op_name)
+        if contract is None:
+            continue
+        arity = contract.serialized_arity
+        attrs = op.get("attrs", [])
+        if attrs is None:
+            attrs = []
+        if not isinstance(attrs, list) or not all(isinstance(item, str) for item in attrs):
+            raise PipelineCliError(f"Operator #{index} attrs must be an array of strings")
+        _validate_attr_count(index, op_name, attrs)
+        min_inputs, max_inputs, min_outputs, max_outputs, nullable_inputs, nullable_outputs = arity
+        inputs = op.get("inputs", [])
+        outputs = op.get("outputs", [])
+        if not isinstance(inputs, list) or not isinstance(outputs, list):
+            raise PipelineCliError(f"Operator #{index} inputs and outputs must be arrays")
+        _validate_count(op_name, "input", len(inputs), minimum=min_inputs, maximum=max_inputs)
+        _validate_count(op_name, "output", len(outputs), minimum=min_outputs, maximum=max_outputs)
+        _validate_non_nullable_slots(op_name, "input", inputs, nullable_inputs)
+        _validate_non_nullable_slots(op_name, "output", outputs, nullable_outputs)
+
+
+def _validate_attr_count(index: int, op_name: str, attrs: Sequence[str]) -> None:
+    required = 0
+    maximum: Optional[int] = 0
+    if op_name in {"ARITHMETIC_COMPOSE", "CONVERT_COLOR", "CUSTOMIZED_COMPARE"}:
+        required = maximum = 1
+    elif op_name in {"NORMALIZE", "NMS", "SORT_MAT", "NORM"}:
+        maximum = 1
+    elif op_name in {
+        "UPDATE_GLTF",
+        "RENDER_TEXT",
+        "SSMR_UPDATE_COMPONENT",
+        "MICROPHONE",
+        "SPEAKER",
+        "JS_SCRIPTING",
+    }:
+        required = maximum = 1
+    if len(attrs) < required:
+        raise PipelineCliError(f"Operator #{index} {op_name} requires at least {required} attrs value(s)")
+    if maximum is not None and len(attrs) > maximum:
+        raise PipelineCliError(f"Operator #{index} {op_name} accepts at most {maximum} attrs value(s)")
+
+
+def _reject_legacy_operator_fields(spec: Mapping[str, Any]) -> None:
+    for index, op in enumerate(spec.get("operators", [])):
+        if not isinstance(op, Mapping):
+            continue
+        legacy_fields = sorted(key for key in op if key in _LEGACY_OPERATOR_FIELDS)
+        if legacy_fields:
+            raise PipelineCliError(
+                f"Operator #{index} uses legacy package field(s): "
+                f"{', '.join(legacy_fields)}. Use attrs and inline model metadata instead."
+            )
 
 
 def _validate_and_write(path: Path, spec: Mapping[str, Any]) -> None:
@@ -954,6 +966,10 @@ def _validate_tensor_references(spec: Mapping[str, Any]) -> None:
                     raise PipelineCliError(
                         f"Operator #{index} references unknown tensor '{tensor_name}'"
                     )
+                if ref is not None and not isinstance(ref, Mapping):
+                    raise PipelineCliError(
+                        f"Operator #{index} {key} entries must be tensor-reference objects or null"
+                    )
 
 
 def _operator_references_to_tensor(spec: Mapping[str, Any], tensor_name: str) -> list[tuple[int, str]]:
@@ -964,7 +980,7 @@ def _operator_references_to_tensor(spec: Mapping[str, Any], tensor_name: str) ->
         for key in ("inputs", "outputs"):
             for ref in op.get(key, []):
                 if _resolve_ref_name(ref) == tensor_name:
-                    references.append((index, str(op.get("type") or op.get("operator_type") or "<unknown>")))
+                    references.append((index, str(op.get("type") or "<unknown>")))
                     break
             else:
                 continue
@@ -978,7 +994,7 @@ def _classify_mode_specific_operators(operators: Sequence[Any]) -> dict[str, set
     for op in operators:
         if not isinstance(op, Mapping):
             continue
-        op_type = _operator_enum_name(str(op.get("type") or op.get("operator_type") or ""))
+        op_type = _operator_enum_name(str(op.get("type") or ""))
         if op_type in _XR_ONLY_OPERATORS:
             xr_only.append(op_type)
         if op_type in _SPATIAL_ONLY_OPERATORS:
@@ -1052,6 +1068,59 @@ def _resolve_ref_name(ref: Any) -> Optional[str]:
     return None
 
 
+def _normalize_tensor_ref(ref: Any) -> Optional[dict[str, str]]:
+    if isinstance(ref, str) and ref.strip().lower() in {"null", "none"}:
+        return None
+    tensor_name = _resolve_ref_name(ref)
+    if tensor_name is None:
+        return None
+    result = _tensor_ref(tensor_name)
+    if isinstance(ref, Mapping) and isinstance(ref.get("name"), str):
+        result["name"] = ref["name"]
+    return result
+
+
+def _tensor_ref(name: str) -> dict[str, str]:
+    return {"tensor": name}
+
+
+def _model_io_metadata(refs: Sequence[Any], tensors: Mapping[str, Any]) -> list[dict[str, Any]]:
+    metadata = []
+    for ref in refs:
+        name = _resolve_ref_name(ref)
+        if not name:
+            continue
+        tensor = tensors.get(name, {})
+        dimensions = list(tensor.get("dimensions", [])) if isinstance(tensor, Mapping) else []
+        channels = int(tensor.get("channels", 1) or 1) if isinstance(tensor, Mapping) else 1
+        shape = [*dimensions, channels] if channels > 1 else dimensions
+        logical_name = ref.get("name") if isinstance(ref, Mapping) and ref.get("name") else name
+        metadata.append(
+            {
+                "name": logical_name,
+                "shape": shape,
+                "encoding_type": _encoding_type(tensor.get("data_type") if isinstance(tensor, Mapping) else None),
+            }
+        )
+    return metadata
+
+
+def _encoding_type(data_type: Any) -> str:
+    try:
+        code = int(data_type)
+    except (TypeError, ValueError):
+        code = int(EDataType.FLOAT32)
+    return {
+        int(EDataType.UINT8): "UINT8",
+        int(EDataType.INT8): "INT8",
+        int(EDataType.UINT16): "UINT16",
+        int(EDataType.INT16): "INT16",
+        int(EDataType.INT32): "INT32",
+        int(EDataType.FLOAT32): "FP32",
+        int(EDataType.FLOAT64): "FP64",
+    }.get(code, "FP32")
+
+
 def _append_unique(values: list[str], value: str) -> None:
     if value not in values:
         values.append(value)
@@ -1117,27 +1186,21 @@ def _parse_value_list(value: str) -> list[Any]:
             else:
                 result.append(int(text, 0))
         except ValueError:
-            result.append(text)
+            raise PipelineCliError(f"Invalid numeric tensor data: {text}")
     return result
 
 
 def _operator_type(op_type: str) -> str:
-    key = op_type.strip()
-    alias = _OP_ALIASES.get(key.lower())
-    if alias:
-        return alias
-    if key.startswith("XR_SECURE_MR_OPERATOR_TYPE_"):
-        return key
-    return f"XR_SECURE_MR_OPERATOR_TYPE_{key.upper()}_PICO"
+    key = str(op_type)
+    if not package_operator_name(key):
+        raise PipelineCliError(
+            f"Unsupported operator type {op_type!r}; use a canonical XR_SECURE_MR_OPERATOR_TYPE_*_PICO name"
+        )
+    return key
 
 
 def _operator_enum_name(op_type: str) -> str:
-    value = str(op_type).strip()
-    if value.startswith("XR_SECURE_MR_OPERATOR_TYPE_"):
-        value = value[len("XR_SECURE_MR_OPERATOR_TYPE_"):]
-    if value.endswith("_PICO"):
-        value = value[: -len("_PICO")]
-    return value.upper()
+    return package_operator_name(str(op_type))
 
 
 def _normalize_model_path(model: str) -> str:
