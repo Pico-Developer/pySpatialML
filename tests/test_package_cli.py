@@ -18,29 +18,158 @@ def _read_json(path):
 
 def _pipeline_with_model(model_path="face.tflite"):
     return {
-        "tensors": {},
+        "tensors": {
+            "input": {"dimensions": [1, 4], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+            "output": {"dimensions": [1, 2], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+        },
         "operators": [
             {
                 "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                "inputs": [],
-                "outputs": [],
-                "model_type": "tflite",
+                "inputs": [{"tensor": "input"}],
+                "outputs": [{"tensor": "output"}],
                 "model": {
                     "bin_path": model_path,
                     "model_name": "face",
                     "model_type": "tflite",
+                    "model_target": "npu",
+                    "input": [
+                        {"name": "input", "shape": [1, 4], "encoding_type": "FP32"},
+                    ],
+                    "output": [
+                        {"name": "output", "shape": [1, 2], "encoding_type": "FP32"},
+                    ],
                 },
             }
         ],
-        "inputs": [],
-        "outputs": [],
+        "inputs": ["input"],
+        "outputs": ["output"],
     }
 
 
 def _pipeline_with_operator(op_type):
+    prefix = "XR_SECURE_MR_OPERATOR_TYPE_"
+    suffix = "_PICO"
+    assert op_type.startswith(prefix) and op_type.endswith(suffix)
+    normalized = op_type[len(prefix):-len(suffix)]
+    if normalized == "MICROPHONE":
+        return {
+            "tensors": {
+                "stereo": {
+                    "dimensions": [128, 2],
+                    "channels": 1,
+                    "data_type": 6,
+                    "is_placeholder": True,
+                    "usage": 6,
+                },
+                "left": {
+                    "dimensions": [128, 1],
+                    "channels": 1,
+                    "data_type": 6,
+                    "is_placeholder": True,
+                    "usage": 6,
+                },
+                "right": {
+                    "dimensions": [128, 1],
+                    "channels": 1,
+                    "data_type": 6,
+                    "is_placeholder": True,
+                    "usage": 6,
+                },
+                "timestamp": {
+                    "dimensions": [1],
+                    "channels": 4,
+                    "data_type": 5,
+                    "is_placeholder": True,
+                    "usage": 5,
+                },
+            },
+            "operators": [{
+                "type": op_type,
+                "inputs": [],
+                "outputs": [
+                    {"tensor": "stereo"},
+                    {"tensor": "left"},
+                    {"tensor": "right"},
+                    {"tensor": "timestamp"},
+                ],
+                "attrs": ["48000;PCM_FLOAT"],
+            }],
+            "inputs": [],
+            "outputs": [],
+        }
+    if normalized in {"RENDER_TEXT", "SWITCH_GLTF_RENDER_STATUS", "UPDATE_GLTF", "UPLOAD_TEXTURE_TO_GLTF"}:
+        tensors = {
+            "gltf": {"dimensions": [1, 1], "channels": 1, "data_type": 1, "is_placeholder": True, "usage": 7, "is_gltf": True},
+            "text": {"dimensions": [1], "channels": 1, "data_type": 1, "is_placeholder": False, "usage": 2},
+            "start": {"dimensions": [1], "channels": 2, "data_type": 6, "is_placeholder": False, "usage": 1},
+            "colors": {"dimensions": [2], "channels": 4, "data_type": 1, "is_placeholder": False, "usage": 4},
+            "texture": {"dimensions": [1], "channels": 1, "data_type": 3, "is_placeholder": False, "usage": 2},
+            "font_size": {"dimensions": [1], "channels": 1, "data_type": 6, "is_placeholder": False, "usage": 2},
+        }
+        operator = {
+            "type": op_type,
+            "inputs": [{"tensor": "text"}, {"tensor": "start"}, {"tensor": "colors"}, {"tensor": "gltf"}, {"tensor": "texture"}, {"tensor": "font_size"}],
+            "outputs": [],
+            "attrs": ["bold#en-us#512#64"],
+        }
+        if normalized == "SWITCH_GLTF_RENDER_STATUS":
+            operator = {"type": op_type, "inputs": [{"tensor": "gltf"}, None, None, None], "outputs": []}
+        elif normalized == "UPDATE_GLTF":
+            operator = {"type": op_type, "inputs": [{"tensor": "gltf"}, None, None], "outputs": [], "attrs": ["world pose"]}
+        elif normalized == "UPLOAD_TEXTURE_TO_GLTF":
+            tensors["image"] = {"dimensions": [2, 2], "channels": 3, "data_type": 1, "is_placeholder": False, "usage": 6}
+            operator = {"type": op_type, "inputs": [{"tensor": "gltf"}, {"tensor": "image"}], "outputs": [{"tensor": "texture"}]}
+        return {
+            "tensors": tensors,
+            "operators": [operator],
+            "inputs": [],
+            "outputs": [],
+        }
+    if normalized in {
+        "SSMR_UPDATE_COMPONENT", "SSMR_SWITCH_VISIBILITY",
+        "UPDATE_COMPONENT", "SCENEGRAPH_VISIBILITY",
+    }:
+        canonical = {
+            "UPDATE_COMPONENT": "SSMR_UPDATE_COMPONENT",
+            "SCENEGRAPH_VISIBILITY": "SSMR_SWITCH_VISIBILITY",
+        }.get(normalized, normalized)
+        operator = {
+            "type": op_type,
+            "inputs": [{"tensor": "scene"}, {"tensor": "data"}],
+            "outputs": [],
+        }
+        if canonical == "SSMR_UPDATE_COMPONENT":
+            operator["attrs"] = ["/target:Transform.Scale"]
+        return {
+            "tensors": {
+                "scene": {"dimensions": [1, 1], "channels": 1, "data_type": 1, "is_placeholder": True, "usage": 7, "is_gltf": True},
+                "data": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": False, "usage": 6},
+            },
+            "operators": [operator],
+            "inputs": [],
+            "outputs": [],
+        }
+    if normalized == "JAVASCRIPT":
+        return {
+            "tensors": {
+                "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+            },
+            "operators": [{
+                "type": op_type,
+                "inputs": [{"name": "input", "tensor": "input"}],
+                "outputs": [{"name": "output", "tensor": "output"}],
+                "attrs": ["output = input;"],
+            }],
+            "inputs": ["input"],
+            "outputs": ["output"],
+        }
     return {
-        "tensors": {},
-        "operators": [{"type": op_type, "inputs": [], "outputs": []}],
+        "tensors": {
+            "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": False, "usage": 6},
+            "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": False, "usage": 6},
+        },
+        "operators": [{"type": op_type, "inputs": [{"tensor": "input"}], "outputs": [{"tensor": "output"}]}],
         "inputs": [],
         "outputs": [],
     }
@@ -69,7 +198,8 @@ def test_create_package_normalizes_pipeline_and_model_paths(tmp_path):
     assert manifest["runtime"]["supported_modes"] == ["spatial"]
     assert (output / "model" / "face.tflite").read_bytes() == b"model"
     assert packaged_pipeline["operators"][0]["model"]["bin_path"] == "model/face.tflite"
-    assert packaged_pipeline["operators"][0]["model_target"] == packaged_pipeline["operators"][0]["model"].get("model_target", "npu")
+    assert packaged_pipeline["operators"][0]["model"]["model_target"] == "npu"
+    assert "model_target" not in packaged_pipeline["operators"][0]
     assert "model_file" not in packaged_pipeline["operators"][0]
     assert "model_asset" not in packaged_pipeline["operators"][0]
     assert "model_id" not in packaged_pipeline["operators"][0]
@@ -95,6 +225,23 @@ def test_create_package_resolves_model_from_asset_root(tmp_path):
     assert _read_json(output / "pipeline" / "main.json")["operators"][0]["model"]["bin_path"] == "model/face.tflite"
 
 
+def test_create_package_normalizes_pipeline_id_before_building_path(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    _write_json(pipeline, {"tensors": {}, "operators": [], "inputs": [], "outputs": []})
+
+    output = tmp_path / "pkg"
+    package_cli.create_package(
+        package_id="demo",
+        pipelines=[f"group\\main={pipeline}"],
+        output=output,
+    )
+
+    manifest = _read_json(output / "manifest.json")
+    assert manifest["pipelines"] == [{"id": "group/main", "path": "pipeline/group/main.json"}]
+    assert (output / "pipeline" / "group" / "main.json").is_file()
+    assert package_cli.validate_package(output) == 0
+
+
 def test_create_package_normalizes_gltf_tensor_assets(tmp_path):
     source_dir = tmp_path / "src"
     pipeline = source_dir / "display.json"
@@ -104,9 +251,13 @@ def test_create_package_normalizes_gltf_tensor_assets(tmp_path):
         {
             "tensors": {
                 "scene": {
-                    "tensor_type": "gltf",
                     "asset": "frame.gltf",
+                    "is_gltf": True,
                     "is_placeholder": True,
+                    "dimensions": [1, 1],
+                    "channels": 1,
+                    "data_type": 1,
+                    "usage": 7,
                 }
             },
             "operators": [],
@@ -135,7 +286,7 @@ def test_validate_package_reports_gltf_materialization_requirement(tmp_path, cap
     _write_json(
         pipeline,
         {
-            "tensors": {"scene": {"tensor_type": "gltf", "asset": "frame.gltf"}},
+            "tensors": {"scene": {"dimensions": [1, 1], "channels": 1, "data_type": 1, "is_placeholder": True, "usage": 7, "is_gltf": True, "asset": "frame.gltf"}},
             "operators": [], "inputs": [], "outputs": [],
         },
     )
@@ -149,7 +300,7 @@ def test_validate_package_reports_gltf_materialization_requirement(tmp_path, cap
 
 def test_create_package_infers_common_operator_modes_when_supported_modes_omitted(tmp_path):
     pipeline = tmp_path / "pipeline.json"
-    _write_json(pipeline, _pipeline_with_operator("assignment"))
+    _write_json(pipeline, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO"))
 
     output = tmp_path / "pkg"
     package_cli.create_package(
@@ -161,9 +312,48 @@ def test_create_package_infers_common_operator_modes_when_supported_modes_omitte
     assert _read_json(output / "manifest.json")["runtime"]["supported_modes"] == ["xr", "spatial"]
 
 
+def test_create_package_accepts_valid_microphone_attrs(tmp_path):
+    pipeline = tmp_path / "microphone.json"
+    _write_json(pipeline, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO"))
+
+    output = tmp_path / "pkg"
+    package_cli.create_package(
+        package_id="microphone-demo",
+        pipelines=[f"main={pipeline}"],
+        output=output,
+    )
+
+    assert package_cli.validate_package(output) == 0
+
+
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        [],
+        ["48000;PCM_FLOAT", "16000;PCM_16BIT"],
+        ["7999;PCM_16BIT"],
+        ["96001;PCM_16BIT"],
+        ["48000;PCM_8BIT"],
+        ["48000PCM_16BIT"],
+    ],
+)
+def test_create_package_rejects_invalid_microphone_attrs(tmp_path, attrs):
+    pipeline = _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO")
+    pipeline["operators"][0]["attrs"] = attrs
+    source = tmp_path / "microphone.json"
+    _write_json(source, pipeline)
+
+    with pytest.raises(package_cli.PackageCliError):
+        package_cli.create_package(
+            package_id="microphone-demo",
+            pipelines=[f"main={source}"],
+            output=tmp_path / "pkg",
+        )
+
+
 def test_create_package_infers_xr_mode_from_xr_only_operator(tmp_path):
     pipeline = tmp_path / "display.json"
-    _write_json(pipeline, _pipeline_with_operator("render_text"))
+    _write_json(pipeline, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
 
     output = tmp_path / "pkg"
     package_cli.create_package(
@@ -175,9 +365,17 @@ def test_create_package_infers_xr_mode_from_xr_only_operator(tmp_path):
     assert _read_json(output / "manifest.json")["runtime"]["supported_modes"] == ["xr"]
 
 
-def test_create_package_infers_spatial_mode_from_spatial_only_operator(tmp_path):
+@pytest.mark.parametrize(
+    "op_type",
+    [
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+        "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
+        "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
+    ],
+)
+def test_create_package_infers_spatial_mode_from_spatial_only_operator(tmp_path, op_type):
     pipeline = tmp_path / "scene.json"
-    _write_json(pipeline, _pipeline_with_operator("update_component"))
+    _write_json(pipeline, _pipeline_with_operator(op_type))
 
     output = tmp_path / "pkg"
     package_cli.create_package(
@@ -187,6 +385,23 @@ def test_create_package_infers_spatial_mode_from_spatial_only_operator(tmp_path)
     )
 
     assert _read_json(output / "manifest.json")["runtime"]["supported_modes"] == ["spatial"]
+    assert _read_json(output / "pipeline" / "scene.json")["operators"][0]["type"] == op_type
+
+
+def test_create_package_accepts_javascript_alias_and_preserves_type(tmp_path):
+    op_type = "XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO"
+    pipeline = tmp_path / "script.json"
+    _write_json(pipeline, _pipeline_with_operator(op_type))
+
+    output = tmp_path / "pkg"
+    package_cli.create_package(
+        package_id="demo",
+        pipelines=[f"script={pipeline}"],
+        output=output,
+    )
+
+    assert _read_json(output / "manifest.json")["runtime"]["supported_modes"] == ["xr", "spatial"]
+    assert _read_json(output / "pipeline" / "script.json")["operators"][0]["type"] == op_type
 
 
 @pytest.mark.parametrize(
@@ -266,6 +481,7 @@ def test_validate_package_zip_does_not_delete_archive_sibling_directory(tmp_path
                 {
                     "schema_version": "2",
                     "id": "demo",
+                    "runtime": {"supported_modes": ["xr", "spatial"]},
                     "pipelines": [
                         {"id": "main", "path": "pipeline/main.json"}
                     ],
@@ -274,7 +490,8 @@ def test_validate_package_zip_does_not_delete_archive_sibling_directory(tmp_path
         )
         package_zip.writestr("pipeline/main.json", "{}")
 
-    assert package_cli.validate_package(archive) == 0
+    with pytest.raises(package_cli.PackageCliError, match="Pipeline root requires"):
+        package_cli.validate_package(archive)
     assert sentinel.read_text(encoding="utf-8") == "must survive validation"
 
 
@@ -338,7 +555,7 @@ def test_create_package_reconciles_existing_manifest_modes_with_force(tmp_path):
             "runtime": {"supported_modes": ["spatial"]},
         },
     )
-    _write_json(source / "pipeline" / "display.json", _pipeline_with_operator("render_text"))
+    _write_json(source / "pipeline" / "display.json", _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
     original_manifest = _read_json(source / "manifest.json")
 
     with pytest.raises(package_cli.PackageCliError, match="includes spatial.*XR-only"):
@@ -368,8 +585,8 @@ def test_create_package_force_reconcile_failure_leaves_existing_output_unchanged
             "runtime": {"supported_modes": ["xr", "spatial"]},
         },
     )
-    _write_json(source / "pipeline" / "display.json", _pipeline_with_operator("render_text"))
-    _write_json(source / "pipeline" / "scene.json", _pipeline_with_operator("update_component"))
+    _write_json(source / "pipeline" / "display.json", _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
+    _write_json(source / "pipeline" / "scene.json", _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO"))
     output = tmp_path / "existing-output"
     sentinel = output / "sentinel.txt"
     sentinel.parent.mkdir()
@@ -401,6 +618,7 @@ def test_validate_package_accepts_windows_relative_zip_paths(tmp_path):
                 {
                     "schema_version": "2",
                     "id": "demo",
+                    "runtime": {"supported_modes": ["xr", "spatial"]},
                     "pipelines": [{"id": "main", "path": "pipeline/main.json"}],
                 }
             ),
@@ -422,6 +640,7 @@ def test_validate_package_rejects_absolute_manifest_pipeline_path(tmp_path):
         {
             "schema_version": "2",
             "id": "bad",
+            "runtime": {"supported_modes": ["xr", "spatial"]},
             "pipelines": [{"id": "main", "path": str(external_pipeline)}],
         },
     )
@@ -439,6 +658,7 @@ def test_validate_package_rejects_manifest_pipeline_path_traversal(tmp_path):
         {
             "schema_version": "2",
             "id": "bad",
+            "runtime": {"supported_modes": ["xr", "spatial"]},
             "pipelines": [{"id": "main", "path": "../external.json"}],
         },
     )
@@ -456,6 +676,7 @@ def test_validate_package_rejects_absolute_model_asset_path(tmp_path):
         {
             "schema_version": "2",
             "id": "bad",
+            "runtime": {"supported_modes": ["xr", "spatial"]},
             "pipelines": [{"id": "main", "path": "pipeline/main.json"}],
         },
     )
@@ -477,6 +698,7 @@ def test_validate_package_rejects_asset_symlink_escape(tmp_path):
         {
             "schema_version": "2",
             "id": "bad",
+            "runtime": {"supported_modes": ["xr", "spatial"]},
             "pipelines": [{"id": "main", "path": "pipeline/main.json"}],
         },
     )
@@ -519,7 +741,7 @@ def test_validate_package_rejects_spatial_only_operator_for_xr_manifest(tmp_path
     )
     _write_json(
         package / "pipeline" / "scene.json",
-        _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO"),
+        _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO"),
     )
 
     with pytest.raises(package_cli.PackageCliError, match="includes xr.*Spatial-only"):
@@ -539,15 +761,39 @@ def test_validate_package_rejects_mixed_xr_and_spatial_only_operators(tmp_path):
     )
     _write_json(
         package / "pipeline" / "mixed.json",
-        {
-            "tensors": {},
-            "operators": [
-                {"type": "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO", "inputs": [], "outputs": []},
-                {"type": "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO", "inputs": [], "outputs": []},
-            ],
-            "inputs": [],
-            "outputs": [],
-        },
+            {
+                "tensors": {
+                    "text": {"dimensions": [1], "channels": 1, "data_type": 1, "is_placeholder": False, "usage": 2},
+                    "start": {"dimensions": [1], "channels": 2, "data_type": 6, "is_placeholder": False, "usage": 1},
+                    "colors": {"dimensions": [2], "channels": 4, "data_type": 1, "is_placeholder": False, "usage": 4},
+                    "gltf": {"dimensions": [1, 1], "channels": 1, "data_type": 1, "is_placeholder": True, "usage": 7, "is_gltf": True},
+                    "texture": {"dimensions": [1], "channels": 1, "data_type": 3, "is_placeholder": False, "usage": 2},
+                    "font": {"dimensions": [1], "channels": 1, "data_type": 6, "is_placeholder": False, "usage": 2},
+                    "visible": {"dimensions": [1], "channels": 1, "data_type": 1, "is_placeholder": False, "usage": 2},
+                },
+                "operators": [
+                    {
+                        "type": "XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO",
+                        "inputs": [
+                            {"tensor": "text"},
+                            {"tensor": "start"},
+                            {"tensor": "colors"},
+                            {"tensor": "gltf"},
+                            {"tensor": "texture"},
+                            {"tensor": "font"},
+                        ],
+                        "outputs": [],
+                        "attrs": ["bold#en-us#512#64"],
+                    },
+                    {
+                        "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+                        "inputs": [{"tensor": "gltf"}, {"tensor": "visible"}],
+                        "outputs": [],
+                    },
+                ],
+                "inputs": [],
+                "outputs": [],
+            },
     )
 
     with pytest.raises(package_cli.PackageCliError, match="mix XR-only and Spatial-only"):
@@ -587,7 +833,7 @@ def test_validate_package_rejects_spatial_only_operator_when_manifest_claims_bot
     )
     _write_json(
         package / "pipeline" / "scene.json",
-        _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO"),
+        _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO"),
     )
 
     with pytest.raises(package_cli.PackageCliError, match="includes xr.*Spatial-only"):
@@ -596,7 +842,7 @@ def test_validate_package_rejects_spatial_only_operator_when_manifest_claims_bot
 
 def test_create_package_rejects_manifest_modes_for_mode_specific_operators(tmp_path):
     pipeline = tmp_path / "display.json"
-    _write_json(pipeline, _pipeline_with_operator("render_text"))
+    _write_json(pipeline, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
 
     with pytest.raises(package_cli.PackageCliError, match="includes spatial.*XR-only"):
         package_cli.create_package(
@@ -610,8 +856,8 @@ def test_create_package_rejects_manifest_modes_for_mode_specific_operators(tmp_p
 def test_create_package_rejects_mixed_exclusive_operators_across_pipelines(tmp_path):
     display = tmp_path / "display.json"
     scene = tmp_path / "scene.json"
-    _write_json(display, _pipeline_with_operator("render_text"))
-    _write_json(scene, _pipeline_with_operator("update_component"))
+    _write_json(display, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
+    _write_json(scene, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO"))
 
     with pytest.raises(package_cli.PackageCliError, match="mix XR-only and Spatial-only"):
         package_cli.create_package(
@@ -623,7 +869,7 @@ def test_create_package_rejects_mixed_exclusive_operators_across_pipelines(tmp_p
 
 def test_create_package_rejects_explicit_spatial_mode_with_xr_only_operator(tmp_path):
     pipeline = tmp_path / "display.json"
-    _write_json(pipeline, _pipeline_with_operator("render_text"))
+    _write_json(pipeline, _pipeline_with_operator("XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO"))
 
     with pytest.raises(package_cli.PackageCliError, match="includes spatial.*XR-only"):
         package_cli.create_package(

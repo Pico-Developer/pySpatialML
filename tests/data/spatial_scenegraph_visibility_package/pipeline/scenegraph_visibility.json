@@ -1,21 +1,21 @@
 {
-  "metadata": {
-    "version": 1
-  },
   "tensors": {
     "frame_gltf": {
-      "tensor_type": "gltf",
+      "dimensions": [1, 1],
+      "channels": 1,
+      "data_type": 1,
+      "usage": 7,
+      "is_gltf": true,
       "asset": "gltf/frame.gltf",
       "is_placeholder": true
     }
   },
   "operators": [
     {
-      "type": "scenegraph_visibility",
-      "scenegraph": "frame_gltf",
-      "visible": true,
+      "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
       "inputs": [
-        "frame_gltf"
+        {"tensor": "frame_gltf"},
+        null
       ],
       "outputs": []
     }

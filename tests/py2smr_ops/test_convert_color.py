@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for convert_color operator (CONVERT_COLOR)."""
+"""Tests for cvt_color operator (CONVERT_COLOR)."""
 
 import numpy as np
 import pytest
@@ -28,13 +28,13 @@ COLOR_RGB2GRAY = 7
 
 
 class TestConvertColorOp:
-    """Tests for the convert_color operation."""
+    """Tests for the cvt_color operation."""
 
     def test_convert_bgr2rgb(self):
         """Test BGR to RGB conversion."""
         @trace(inputs=["image"], outputs=["result"])
         def bgr_to_rgb(image):
-            return ops.convert_color(image, COLOR_BGR2RGB)
+            return ops.cvt_color(image, COLOR_BGR2RGB)
 
         # Create BGR image
         input_arr = np.zeros((4, 4, 3), dtype=np.uint8)
@@ -58,7 +58,7 @@ class TestConvertColorOp:
         """Test color conversion with random image."""
         @trace(inputs=["image"], outputs=["result"])
         def convert_image(image):
-            return ops.convert_color(image, COLOR_BGR2RGB)
+            return ops.cvt_color(image, COLOR_BGR2RGB)
 
         input_arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
         result, verification = run_op_test(
@@ -77,7 +77,7 @@ class TestConvertColorOp:
         """Test color conversion with larger image."""
         @trace(inputs=["image"], outputs=["result"])
         def convert_image(image):
-            return ops.convert_color(image, COLOR_BGR2RGB)
+            return ops.cvt_color(image, COLOR_BGR2RGB)
 
         input_arr = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
         result, verification = run_op_test(
@@ -89,11 +89,11 @@ class TestConvertColorOp:
         assert verification.success, verification.error_message
 
     @skip_if_no_device
-    def test_convert_color_on_device(self):
+    def test_cvt_color_on_device(self):
         """Test color conversion on device."""
         @trace(inputs=["image"], outputs=["result"])
         def convert_image(image):
-            return ops.convert_color(image, COLOR_BGR2RGB)
+            return ops.cvt_color(image, COLOR_BGR2RGB)
 
         input_arr = np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
         result, verification = run_op_test(

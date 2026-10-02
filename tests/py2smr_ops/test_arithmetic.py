@@ -84,7 +84,7 @@ class TestArithmeticOp:
                 "y": {"dimensions": [2, 2], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
             },
             "operators": [
-                {"type": "arithmetic", "expression": "({0} * {1})", "inputs": ["a", "b"], "outputs": ["y"]}
+                {"type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO", "attrs": ["({0} * {1})"], "inputs": [{"tensor": "a"}, {"tensor": "b"}] + [None] * 8, "outputs": [{"tensor": "y"}]}
             ],
             "inputs": ["a", "b"],
             "outputs": ["y"],

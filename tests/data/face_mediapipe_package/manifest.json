@@ -9,7 +9,7 @@
   ],
   "runtime": {
     "supported_modes": [
-      "spatial"
+      "xr"
     ]
   }
 }

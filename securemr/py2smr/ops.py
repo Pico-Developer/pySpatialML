@@ -27,13 +27,13 @@ import numpy as np
 from securemr.core.types import EOperatorType
 from .tracer import get_current_trace
 
-_OP_GET_TRANSFORM_MAT = getattr(EOperatorType, "GET_TRANSFORM_MAT", getattr(EOperatorType, "MAKE_TRANSFORM_MAT", None))
+_OP_GET_TRANSFORM_MAT = EOperatorType.GET_TRANSFORM_MAT
 _OP_LOAD_TEXTURE = getattr(EOperatorType, "LOAD_TEXTURE", getattr(EOperatorType, "UPLOAD_TEXTURE_TO_GLTF", None))
 _OP_SWAP_HWC_CHW = getattr(EOperatorType, "SWAP_HWC_CHW", getattr(EOperatorType, "CHW_HWC", None))
-_OP_JAVASCRIPT = getattr(EOperatorType, "JAVASCRIPT", getattr(EOperatorType, "JS_SCRIPTING", None))
+_OP_JAVASCRIPT = EOperatorType.JAVASCRIPT
 __all__ = [
     "arithmetic",
-    "convert_color",
+    "cvt_color",
     "normalize",
     "argmax",
     "elementwise_min",
@@ -51,16 +51,16 @@ __all__ = [
     "apply_affine",
     "apply_affine_point",
     "camera_space_to_world",
-    "solve_pnp",
-    "uv_to_3d_in_cam_space",
-    "rectified_vst_access",
+    "solve_p_n_p",
+    "uv_to_3d_in_camera_space",
+    "camera_access",
     "sort_vec",
     "sort_mat",
     "inversion",
     "svd",
     "norm",
     "swap_hwc_chw",
-    "run_model_inference",
+    "run_algorithm",
     "load_texture",
     "switch_gltf_render_status",
     "update_gltf",
@@ -125,7 +125,7 @@ def arithmetic(
     return result
 
 
-def convert_color(
+def cvt_color(
     tensor: np.ndarray,
     code: int,
     output_name: Optional[str] = None,
@@ -173,6 +173,7 @@ def normalize(
     output_name: Optional[str] = None,
     *,
     normalize_type: str = "L2",
+    alpha_beta: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Normalize a tensor.
 
@@ -182,22 +183,40 @@ def normalize(
         tensor: Input tensor.
         normalize_type: Normalization mode: ``L1``, ``L2``, ``INF``, or
             ``MINMAX``. Defaults to ``L2``.
+        alpha_beta: Optional floating-point tensor containing exactly two
+            values, the alpha and beta parameters. Defaults to ``[1.0, 0.0]``.
         output_name: Optional name for the output tensor.
 
     Returns:
         Normalized tensor.
     """
+    has_alpha_beta = alpha_beta is not None
+    if has_alpha_beta:
+        alpha_beta = np.asarray(alpha_beta)
+        if alpha_beta.dtype not in (np.dtype(np.float32), np.dtype(np.float64)):
+            raise ValueError("alpha_beta must have FLOAT32 or FLOAT64 dtype")
+        if alpha_beta.size != 2:
+            raise ValueError("alpha_beta must contain exactly two floating-point values")
+        alpha, beta = (float(value) for value in alpha_beta.reshape(-1))
+    else:
+        alpha, beta = 1.0, 0.0
+
     mode = (normalize_type or "L2").upper()
     values = np.asarray(tensor, dtype=np.float32)
     if mode == "L2":
         scale = float(np.linalg.norm(values.astype(np.float64)))
-        result = values.copy() if scale == 0.0 else values / scale
+        result = values.copy() if scale == 0.0 else values * (alpha / scale)
     elif mode == "L1":
         scale = float(np.sum(np.abs(values), dtype=np.float64))
-        result = values.copy() if scale == 0.0 else values / scale
+        result = values.copy() if scale == 0.0 else values * (alpha / scale)
     elif mode == "INF":
         scale = float(np.max(np.abs(values))) if values.size else 0.0
-        result = values.copy() if scale == 0.0 else values / scale
+        result = values.copy() if scale == 0.0 else values * (alpha / scale)
+    elif mode == "MINMAX" and has_alpha_beta:
+        lower = float(np.min(values)) if values.size else 0.0
+        upper = float(np.max(values)) if values.size else 0.0
+        scale = upper - lower
+        result = np.full_like(values, alpha) if scale == 0.0 else (values - lower) / scale * (beta - alpha) + alpha
     elif mode == "MINMAX":
         lower = float(np.min(values)) if values.size else 0.0
         upper = float(np.max(values)) if values.size else 0.0
@@ -208,10 +227,14 @@ def normalize(
 
     ctx = get_current_trace()
     if ctx is not None:
+        if alpha_beta is not None and ctx.get_tensor_name(alpha_beta) is None:
+            # Constants need to be emitted as initialized local tensors before
+            # record_op resolves the operand reference.
+            ctx.register_tensor(alpha_beta, value=alpha_beta)
         ctx.record_op(
             op_type=EOperatorType.NORMALIZE,
-            attrs=[mode],
-            inputs=[tensor],
+            attrs=[mode] if mode != "L2" or has_alpha_beta else [],
+            inputs=[tensor, alpha_beta] if alpha_beta is not None else [tensor],
             outputs=[result],
             output_names=[output_name] if output_name else None,
         )
@@ -996,7 +1019,7 @@ def norm(
     return result
 
 
-def solve_pnp(
+def solve_p_n_p(
     object_points: np.ndarray,
     image_points: np.ndarray,
     camera_matrix: np.ndarray,
@@ -1009,7 +1032,7 @@ def solve_pnp(
     try:
         import cv2
     except ImportError as exc:
-        raise ImportError("cv2 required for solve_pnp") from exc
+        raise ImportError("cv2 required for solve_p_n_p") from exc
 
     obj_pts = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
     img_pts = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
@@ -1162,7 +1185,7 @@ def swap_hwc_chw(
     return result
 
 
-def uv_to_3d_in_cam_space(
+def uv_to_3d_in_camera_space(
     uv: np.ndarray,
     timestamp: np.ndarray,
     camera_matrix: np.ndarray,
@@ -1236,7 +1259,7 @@ def uv_to_3d_in_cam_space(
     return result
 
 
-def rectified_vst_access(
+def camera_access(
     output_shapes: Optional[List[tuple]] = None,
     output_names: Optional[List[str]] = None,
     image_path: Optional[str] = None,
@@ -1282,6 +1305,27 @@ def rectified_vst_access(
             timestamp = np.zeros((1, 4), dtype=np.int32)
             cam_mat = np.zeros((3, 3), dtype=np.float32)
 
+    # The host implementation has no physical camera calibration.  Still
+    # provide a usable pinhole intrinsic matrix so downstream host operators
+    # such as UV_TO_3D_IN_CAM_SPACE can execute against a supplied image.  A
+    # device VST stream supplies its real calibration through this operator.
+    if np.asarray(cam_mat).shape == (3, 3):
+        image_shape = np.asarray(left).shape if left is not None else ()
+        if len(image_shape) >= 2:
+            height, width = float(image_shape[0]), float(image_shape[1])
+        elif output_shapes and output_shapes[0] and len(output_shapes[0]) >= 2:
+            height, width = float(output_shapes[0][0]), float(output_shapes[0][1])
+        else:
+            height, width = 1.0, 1.0
+        cam_array = np.asarray(cam_mat, dtype=np.float32)
+        if not np.isfinite(cam_array).all() or cam_array[0, 0] == 0.0 or cam_array[1, 1] == 0.0:
+            cam_mat = np.array(
+                [[width, 0.0, width * 0.5],
+                 [0.0, height, height * 0.5],
+                 [0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            )
+
     ctx = get_current_trace()
     if ctx is not None:
         ctx.record_op(
@@ -1295,7 +1339,7 @@ def rectified_vst_access(
     return right, left, timestamp, cam_mat
 
 
-def run_model_inference(
+def run_algorithm(
     inputs: Dict[str, np.ndarray],
     model_file: str,
     model_name: str,
@@ -1320,8 +1364,8 @@ def run_model_inference(
         output_names: List of output tensor names.
         output_shapes: Required list of output shapes for trace-time placeholder tensors.
         output_dtypes: Optional list of output dtypes. Defaults to float32.
-        input_aliasing: Optional input name aliasing.
-        output_aliasing: Optional output name aliasing.
+        input_aliasing: Optional mapping from ``inputs`` keys to model node names.
+        output_aliasing: Optional mapping from output tensor names to model node names.
         model_type: Serialized model runtime type. Only ``tflite`` is supported.
         model: Optional inline model spec to serialize on the operator.
         model_target: Serialized backend target for SpatialML packages.
@@ -1331,30 +1375,66 @@ def run_model_inference(
         Dictionary of trace-time placeholder output tensors.
     """
     if not inputs:
-        raise ValueError("run_model_inference requires at least one input tensor")
+        raise ValueError("run_algorithm requires at least one input tensor")
     if model_type != "tflite":
-        raise ValueError("run_model_inference only supports LiteRT/TFLite model_type='tflite'")
+        raise ValueError("run_algorithm only supports LiteRT/TFLite model_type='tflite'")
     if not model_file.endswith(".tflite"):
         raise ValueError(f"Unsupported model format: {model_file}. Use a .tflite model file")
     if not output_names:
-        raise ValueError("run_model_inference requires at least one output name")
+        raise ValueError("run_algorithm requires at least one output name")
     if not output_shapes or len(output_shapes) != len(output_names):
-        raise ValueError("run_model_inference requires one output shape per output name")
+        raise ValueError("run_algorithm requires one output shape per output name")
 
     output_dtypes = output_dtypes or [np.float32] * len(output_names)
     if len(output_dtypes) != len(output_names):
-        raise ValueError("run_model_inference requires one output dtype per output name")
+        raise ValueError("run_algorithm requires one output dtype per output name")
+
+    def _validate_aliasing(
+        aliases: Optional[Dict[str, str]], available_names: List[str], field: str
+    ) -> Dict[str, str]:
+        aliases = dict(aliases or {})
+        unknown = sorted(set(aliases) - set(available_names))
+        if unknown:
+            raise ValueError(f"{field} contains unknown tensor name(s): {', '.join(unknown)}")
+        for source_name, model_node_name in aliases.items():
+            if not isinstance(model_node_name, str) or not model_node_name:
+                raise ValueError(f"{field}[{source_name!r}] must be a non-empty model node name")
+        return aliases
+
+    input_aliasing = _validate_aliasing(input_aliasing, list(inputs), "input_aliasing")
+    output_aliasing = _validate_aliasing(output_aliasing, output_names, "output_aliasing")
 
     outputs: Dict[str, np.ndarray] = {}
     for name, shape, dtype in zip(output_names, output_shapes, output_dtypes):
         outputs[name] = np.zeros(tuple(shape), dtype=np.dtype(dtype))
 
     if model is None:
+        def _model_encoding(dtype):
+            return {
+                np.dtype(np.uint8): "uint8",
+                np.dtype(np.int8): "int8",
+                np.dtype(np.uint16): "uint16",
+                np.dtype(np.int16): "int16",
+                np.dtype(np.int32): "int32",
+                np.dtype(np.float32): "float32",
+                np.dtype(np.float64): "float64",
+            }[np.dtype(dtype)]
+
         model = {
             "bin_path": model_file,
             "model_name": model_name,
             "model_type": "tflite",
             "model_target": model_target,
+            "input": [
+                {"name": alias, "shape": list(np.asarray(tensor).shape),
+                 "encoding_type": _model_encoding(np.asarray(tensor).dtype)}
+                for alias, tensor in inputs.items()
+            ],
+            "output": [
+                {"name": name, "shape": list(shape),
+                 "encoding_type": _model_encoding(dtype)}
+                for name, shape, dtype in zip(output_names, output_shapes, output_dtypes or [np.float32] * len(output_names))
+            ],
             **({"cpu_target_num_threads": int(cpu_target_num_threads)} if model_target == "cpu" else {}),
         }
     else:
@@ -1372,15 +1452,30 @@ def run_model_inference(
         for alias, tensor in inputs.items():
             tensor_name = ctx.get_tensor_name(tensor)
             if tensor_name is not None:
-                input_refs.append({"name": alias, "tensor": tensor_name})
-        output_refs = [{"name": name, "tensor": name} for name in output_names]
+                input_refs.append({
+                    "name": input_aliasing.get(alias, alias),
+                    "tensor": tensor_name,
+                })
+        output_refs = [
+            {"name": output_aliasing.get(name, name), "tensor": name}
+            for name in output_names
+        ]
+        if model is not None:
+            for field, refs in (("input", input_refs), ("output", output_refs)):
+                metadata = model.get(field)
+                if isinstance(metadata, list):
+                    model[field] = [
+                        {**item, "name": refs[index]["name"]}
+                        if index < len(refs) and isinstance(item, dict) else item
+                        for index, item in enumerate(metadata)
+                    ]
         extra_info = {
             "model_name": model_name,
             "model_type": model_type,
             "model_target": model_target,
             "cpu_target_num_threads": int(cpu_target_num_threads),
-            "input_aliasing": input_aliasing or {},
-            "output_aliasing": output_aliasing or {},
+            "input_aliasing": input_aliasing,
+            "output_aliasing": output_aliasing,
             "output_names": output_names,
             "input_refs": input_refs,
             "output_refs": output_refs,
@@ -1428,27 +1523,17 @@ def load_texture(
 def switch_gltf_render_status(
     gltf_placeholder: np.ndarray,
     pose: Optional[np.ndarray] = None,
-    view_locked: Optional[Union[np.ndarray, bool]] = None,
-    visible: Optional[Union[np.ndarray, bool]] = None,
 ) -> None:
     """Stub for toggling glTF render status.
 
     Corresponds to EOperatorType.SWITCH_GLTF_RENDER_STATUS.
     """
-    _ = (gltf_placeholder, pose, view_locked, visible)
+    _ = (gltf_placeholder, pose)
     ctx = get_current_trace()
     if ctx is not None:
         inputs = [gltf_placeholder]
-        input_indices = {}
         if pose is not None:
-            input_indices["pose"] = len(inputs)
             inputs.append(pose)
-        if isinstance(view_locked, np.ndarray):
-            input_indices["view_locked"] = len(inputs)
-            inputs.append(view_locked)
-        if isinstance(visible, np.ndarray):
-            input_indices["visible"] = len(inputs)
-            inputs.append(visible)
         ctx.record_op(
             op_type=EOperatorType.SWITCH_GLTF_RENDER_STATUS,
             attrs=[],
@@ -1456,11 +1541,7 @@ def switch_gltf_render_status(
             outputs=[],
             extra_info={
                 "gltf_input_index": 0,
-                "pose_input_index": input_indices.get("pose"),
-                "view_locked_input_index": input_indices.get("view_locked"),
-                "visible_input_index": input_indices.get("visible"),
-                "view_locked": bool(view_locked) if isinstance(view_locked, (bool, np.bool_)) else None,
-                "visible": bool(visible) if isinstance(visible, (bool, np.bool_)) else None,
+                "pose_input_index": 1 if pose is not None else None,
             },
         )
 
@@ -1468,47 +1549,67 @@ def switch_gltf_render_status(
 def update_gltf(
     gltf_placeholder: np.ndarray,
     update_type: str,
-    values: Optional[np.ndarray] = None,
-    ids: Optional[np.ndarray] = None,
+    operands: Optional[List[np.ndarray]] = None,
 ) -> None:
     """Stub for updating glTF attributes.
 
     Corresponds to EOperatorType.UPDATE_GLTF.
     """
-    _ = (gltf_placeholder, values, ids)
+    operands = list(operands or [])
     ctx = get_current_trace()
+    material_texture_types = {
+        "material::metallic_roughness_texture", "material::base_color_texture",
+        "material::normal_map_texture", "material::occlusion_texture",
+        "material::emissive_texture",
+    }
+    material_color_types = {"material::base_color_factor", "material::emissive_factor"}
+    if ctx is not None and len(operands) < {
+        "texture": 2, "animation": 2, "world pose": 1, "local": 2,
+    }.get(update_type, 2):
+        defaults = {
+            "texture": [np.array([0], dtype=np.uint16), np.zeros((1, 1, 3), dtype=np.uint8)],
+            "animation": [np.array([0], dtype=np.uint16), np.array([0.0], dtype=np.float32)],
+            "world pose": [np.eye(4, dtype=np.float32)],
+            "local": [np.array([0], dtype=np.uint16), np.eye(4, dtype=np.float32)],
+        }.get(
+            update_type,
+            [
+                np.array([0], dtype=np.uint16),
+                np.array(
+                    [0] if update_type in material_texture_types else
+                    [0.0, 0.0, 0.0, 0.0] if update_type in material_color_types else [0.0],
+                    dtype=np.uint16 if update_type in material_texture_types else np.float32,
+                ),
+            ],
+        )
+        operands.extend(defaults[len(operands):])
+    required_operands = {
+        "texture": 2,
+        "animation": 2,
+        "world pose": 1,
+        "local": 2,
+    }.get(update_type, 2)
+    if len(operands) < required_operands:
+        raise ValueError(f"update_gltf {update_type!r} requires {required_operands} operand tensor(s)")
     if ctx is not None:
-        inputs = [gltf_placeholder]
-        input_indices = {}
-        if values is not None:
-            input_indices["values"] = len(inputs)
-            inputs.append(values)
-        if ids is not None:
-            input_indices["ids"] = len(inputs)
-            inputs.append(ids)
+        for operand in operands:
+            ctx.register_tensor(np.asarray(operand), value=np.asarray(operand))
         ctx.record_op(
             op_type=EOperatorType.UPDATE_GLTF,
             attrs=[update_type],
-            inputs=inputs,
+            inputs=[gltf_placeholder, *operands[:2]],
             outputs=[],
             extra_info={
                 "update_type": update_type,
-                "attribute": update_type,
-                "gltf_input_index": 0,
-                "values_input_index": input_indices.get("values"),
-                "ids_input_index": input_indices.get("ids"),
             },
         )
 
 
 def render_text(
     gltf_placeholder: np.ndarray,
+    config: str,
     text: str,
-    language_and_locale: str,
-    canvas_width: int,
-    canvas_height: int,
-    typeface: str = "bold",
-    start_position: Optional[np.ndarray] = None,
+    start: Optional[np.ndarray] = None,
     colors: Optional[np.ndarray] = None,
     texture_id: Optional[np.ndarray] = None,
     font_size: Optional[np.ndarray] = None,
@@ -1517,46 +1618,28 @@ def render_text(
 
     Corresponds to EOperatorType.RENDER_TEXT.
     """
-    _ = (gltf_placeholder, text, language_and_locale, canvas_width, canvas_height, typeface,
-         start_position, colors, texture_id, font_size)
     ctx = get_current_trace()
     if ctx is not None:
-        inputs = [gltf_placeholder]
-        input_indices = {}
-        for name, tensor in (
-            ("start", start_position),
-            ("colors", colors),
-            ("texture_id", texture_id),
-            ("font_size", font_size),
-        ):
-            if isinstance(tensor, np.ndarray):
-                input_indices[name] = len(inputs)
-                inputs.append(tensor)
-        gltf_input_index = 0
+        def constant(value: np.ndarray) -> np.ndarray:
+            value = np.asarray(value)
+            ctx.register_tensor(value, value=value)
+            return value
+
+        text_tensor = constant(np.frombuffer(text.encode("utf-8"), dtype=np.uint8))
+        start_tensor = constant(np.asarray(start if start is not None else [0.0, 0.0], dtype=np.float32))
+        colors_tensor = constant(np.asarray(
+            colors if colors is not None else [[255, 255, 255, 255], [0, 0, 0, 0]], dtype=np.uint8
+        ))
+        texture_tensor = constant(np.asarray(texture_id if texture_id is not None else [0], dtype=np.uint16))
+        font_tensor = constant(np.asarray(font_size if font_size is not None else [16.0], dtype=np.float32))
         ctx.record_op(
             op_type=EOperatorType.RENDER_TEXT,
-            attrs=[f"{typeface}#{language_and_locale}#{canvas_width}#{canvas_height}", text],
-            inputs=inputs,
+            attrs=[config],
+            inputs=[text_tensor, start_tensor, colors_tensor, gltf_placeholder, texture_tensor, font_tensor],
             outputs=[],
             extra_info={
+                "config": config,
                 "text": text,
-                "language_and_locale": language_and_locale,
-                "typeface": typeface,
-                "canvas_width": int(canvas_width),
-                "canvas_height": int(canvas_height),
-                "gltf_input_index": gltf_input_index,
-                "start_input_index": input_indices.get("start"),
-                "colors_input_index": input_indices.get("colors"),
-                "texture_id_input_index": input_indices.get("texture_id"),
-                "font_size_input_index": input_indices.get("font_size"),
-                "start": None if isinstance(start_position, np.ndarray) else (
-                    [0.0, 0.0] if start_position is None else np.asarray(start_position).tolist()
-                ),
-                "colors": None if isinstance(colors, np.ndarray) else (
-                    [[255, 255, 255, 255], [0, 0, 0, 0]] if colors is None else np.asarray(colors).tolist()
-                ),
-                "texture_id": None if isinstance(texture_id, np.ndarray) else (0 if texture_id is None else int(np.asarray(texture_id).reshape(-1)[0])),
-                "font_size": None if isinstance(font_size, np.ndarray) else (16.0 if font_size is None else float(np.asarray(font_size).reshape(-1)[0])),
             },
         )
 
@@ -1578,13 +1661,14 @@ def scenegraph_visibility(
     if ctx is not None:
         ctx.record_op(
             op_type=EOperatorType.SCENEGRAPH_VISIBILITY,
-            attrs=["true" if visible_value else "false"],
-            inputs=[scenegraph, visible] if isinstance(visible, np.ndarray) else [scenegraph],
+            attrs=[],
+            inputs=[scenegraph, visible] if isinstance(visible, np.ndarray) else [
+                scenegraph, np.asarray([1 if visible_value else 0], dtype=np.uint8)
+            ],
             outputs=[result],
             output_names=[output_name] if output_name else None,
             extra_info={
-                "visible_input_index": 1 if isinstance(visible, np.ndarray) else None,
-                "visible": None if isinstance(visible, np.ndarray) else visible_value,
+                "visible_input_index": 1,
             },
         )
 
@@ -1623,18 +1707,34 @@ def update_component(
     return result
 
 
-def microphone(output_shape: tuple = (1,), output_name: Optional[str] = None) -> np.ndarray:
+def microphone(
+    output_shape: tuple = (1, 2),
+    output_name: Optional[str] = None,
+    *,
+    sample_rate: int = 16000,
+    encoding: str = "PCM_FLOAT",
+) -> np.ndarray:
     """Stub for microphone capture.
 
     Corresponds to EOperatorType.MICROPHONE.
     """
-    result = np.zeros(output_shape, dtype=np.float32)
+    if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or not 8000 <= sample_rate <= 96000:
+        raise ValueError("sample_rate must be an integer between 8000 and 96000 Hz")
+    encoding_dtypes = {
+        "PCM_16BIT": np.int16,
+        "PCM_32BIT": np.int32,
+        "PCM_FLOAT": np.float32,
+    }
+    if encoding not in encoding_dtypes:
+        raise ValueError("encoding must be PCM_16BIT, PCM_32BIT, or PCM_FLOAT")
+
+    result = np.zeros(output_shape, dtype=encoding_dtypes[encoding])
 
     ctx = get_current_trace()
     if ctx is not None:
         ctx.record_op(
             op_type=EOperatorType.MICROPHONE,
-            attrs=[],
+            attrs=[f"{sample_rate};{encoding}"],
             inputs=[],
             outputs=[result],
             output_names=[output_name] if output_name else None,
@@ -1643,16 +1743,24 @@ def microphone(output_shape: tuple = (1,), output_name: Optional[str] = None) ->
     return result
 
 
-def speaker(audio: np.ndarray, output_name: Optional[str] = None) -> None:
+def speaker(
+    audio: np.ndarray,
+    output_name: Optional[str] = None,
+    *,
+    sample_rate: int = 16000,
+) -> None:
     """Stub for speaker playback.
 
     Corresponds to EOperatorType.SPEAKER.
     """
+    if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or not 8000 <= sample_rate <= 96000:
+        raise ValueError("sample_rate must be an integer between 8000 and 96000 Hz")
+
     ctx = get_current_trace()
     if ctx is not None:
         ctx.record_op(
             op_type=EOperatorType.SPEAKER,
-            attrs=[],
+            attrs=[str(sample_rate)],
             inputs=[audio],
             outputs=[],
             output_names=[],
@@ -1829,6 +1937,7 @@ def javascript(
     js_code: str,
     inputs: Dict[str, np.ndarray],
     output_names: List[str],
+    output_specs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, np.ndarray]:
     """Execute JavaScript-like code over tensors.
 
@@ -1841,14 +1950,37 @@ def javascript(
     template = None
     if inputs:
         template = next(iter(inputs.values()))
+
+    def output_shape(name: str) -> tuple[int, ...]:
+        spec = (output_specs or {}).get(name, {})
+        dimensions = spec.get("dimensions", [])
+        channels = int(spec.get("channels", 1) or 1)
+        if isinstance(dimensions, list) and dimensions:
+            shape = tuple(int(item) for item in dimensions)
+            if channels > 1:
+                shape += (channels,)
+            return shape
+        if template is not None:
+            return tuple(np.asarray(template).shape)
+        return (1,)
+
+    def output_dtype(name: str) -> np.dtype:
+        code = int((output_specs or {}).get(name, {}).get("data_type", 6) or 6)
+        return {
+            1: np.dtype(np.uint8),
+            2: np.dtype(np.int8),
+            3: np.dtype(np.uint16),
+            4: np.dtype(np.int16),
+            5: np.dtype(np.int32),
+            6: np.dtype(np.float32),
+            7: np.dtype(np.float64),
+        }.get(code, np.dtype(np.float32))
+
     for name in output_names:
         if name in inputs:
             outputs[name] = inputs[name]
         else:
-            if template is not None:
-                outputs[name] = np.zeros_like(template, dtype=np.float32)
-            else:
-                outputs[name] = np.zeros((1,), dtype=np.float32)
+            outputs[name] = np.zeros(output_shape(name), dtype=output_dtype(name))
         env[name] = _JsArray(outputs[name])
 
     def _tokenize_js(code: str) -> List[str]:

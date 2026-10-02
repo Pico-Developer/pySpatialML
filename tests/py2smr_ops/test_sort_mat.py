@@ -17,8 +17,8 @@ def traced_sort_mat_col(mat):
 def _run(mat, traced, device):
     (sorted_mat, indices), ctx = traced.trace(mat=mat)
     spec = convert(ctx)
-    assert spec["operators"][0]["mode"] in {"ROW", "COLUMN"}
-    assert "axis" not in spec["operators"][0]
+    assert spec["operators"][0]["attrs"] in [["ROW"], ["COLUMN"]]
+    assert "mode" not in spec["operators"][0]
     expected = {"sorted": sorted_mat, "indices": indices}
     return verify(spec, {"mat": mat}, expected_outputs=expected, device=device)
 

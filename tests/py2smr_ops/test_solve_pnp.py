@@ -7,8 +7,8 @@ from .conftest import skip_if_no_device
 
 
 @trace(inputs=["object_points", "image_points", "camera_matrix"], outputs=["rvec", "tvec"])
-def traced_solve_pnp(object_points, image_points, camera_matrix):
-    return ops.solve_pnp(object_points, image_points, camera_matrix, output_names=["rvec", "tvec"])
+def traced_solve_p_n_p(object_points, image_points, camera_matrix):
+    return ops.solve_p_n_p(object_points, image_points, camera_matrix, output_names=["rvec", "tvec"])
 
 
 def _build_inputs():
@@ -29,9 +29,9 @@ def _build_inputs():
     return obj, img_pts, cam.astype(np.float32)
 
 
-def test_solve_pnp_host():
+def test_solve_p_n_p_host():
     obj, img, cam = _build_inputs()
-    (rvec, tvec), ctx = traced_solve_pnp.trace(
+    (rvec, tvec), ctx = traced_solve_p_n_p.trace(
         object_points=obj, image_points=img, camera_matrix=cam
     )
     spec = convert(ctx)
@@ -41,9 +41,9 @@ def test_solve_pnp_host():
 
 
 @skip_if_no_device
-def test_solve_pnp_device():
+def test_solve_p_n_p_device():
     obj, img, cam = _build_inputs()
-    (rvec, tvec), ctx = traced_solve_pnp.trace(
+    (rvec, tvec), ctx = traced_solve_p_n_p.trace(
         object_points=obj, image_points=img, camera_matrix=cam
     )
     spec = convert(ctx)
