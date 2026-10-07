@@ -22,14 +22,14 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 
 from securemr.core.types import BaseType, EDataType, EOperatorType
-from securemr.core.utils import convert_from_dtype, convert_to_dtype, mat_flag, type_to_name
+from securemr.core.utils import TensorType, convert_from_dtype, convert_to_dtype, mat_flag
 
 from .tracer import TraceContext, TensorInfo, TracedOp
 from .verifier import validate_pipeline_spec
 
 __all__ = ["convert", "trace_to_pipeline_spec"]
 
-_OP_JAVASCRIPT = getattr(EOperatorType, "JAVASCRIPT", getattr(EOperatorType, "JS_SCRIPTING", None))
+_OP_JAVASCRIPT = EOperatorType.JAVASCRIPT
 _OP_SORT_MAT = getattr(EOperatorType, "SORT_MAT", None)
 _OP_NORM = getattr(EOperatorType, "NORM", None)
 _OP_RENDER_TEXT = getattr(EOperatorType, "RENDER_TEXT", None)
@@ -40,6 +40,7 @@ _OP_SOLVE_PNP = getattr(EOperatorType, "SOLVE_P_N_P", None)
 _OP_SORT_VEC = getattr(EOperatorType, "SORT_VEC", None)
 _OP_SWITCH_GLTF_RENDER_STATUS = getattr(EOperatorType, "SWITCH_GLTF_RENDER_STATUS", None)
 _OP_LOAD_TEXTURE = getattr(EOperatorType, "LOAD_TEXTURE", None)
+_OP_SWAP_HWC_CHW = getattr(EOperatorType, "SWAP_HWC_CHW", None)
 
 
 # Mapping from numpy dtype to EDataType
@@ -59,8 +60,21 @@ def _get_edatatype(dtype: np.dtype) -> EDataType:
     dtype_type = np.dtype(dtype).type
     if dtype_type in NUMPY_TO_EDATATYPE:
         return NUMPY_TO_EDATATYPE[dtype_type]
-    # Default to float32 for unknown types
-    return EDataType.FLOAT32
+    raise ValueError(f"Unsupported traced tensor dtype: {np.dtype(dtype)}")
+
+
+def _canonical_operator_type(operator_type: EOperatorType) -> str:
+    """Return the one package spelling for an internal operator enum."""
+    canonical_name = operator_type.name
+    canonical_name = {
+        "SWAP_HWC_CHW": "CHW_HWC",
+        "GET_TRANSFORM_MAT": "MAKE_TRANSFORM_MAT",
+        "LOAD_TEXTURE": "UPLOAD_TEXTURE_TO_GLTF",
+        "SCENEGRAPH_VISIBILITY": "SSMR_SWITCH_VISIBILITY",
+        "UPDATE_COMPONENT": "SSMR_UPDATE_COMPONENT",
+        "JAVASCRIPT": "JS_SCRIPTING",
+    }.get(canonical_name, canonical_name)
+    return f"XR_SECURE_MR_OPERATOR_TYPE_{canonical_name}_PICO"
 
 
 def _tensor_info_to_spec(info: TensorInfo) -> Dict[str, Any]:
@@ -108,139 +122,98 @@ def _tensor_info_to_spec(info: TensorInfo) -> Dict[str, Any]:
         "flag": flag,
     }
 
-    # Include value for non-placeholder tensors with stored values
+    # The package schema calls preloaded tensor contents `data`.
     if info.value is not None and not info.is_input:
-        spec["value"] = [float(x) for x in info.value.flatten()]
+        spec["data"] = [x.item() if isinstance(x, np.generic) else x for x in info.value.flatten()]
 
     return spec
 
 
 def _op_to_spec(op: TracedOp) -> Dict[str, Any]:
     """Convert TracedOp to pipeline operator spec."""
+    type_name = _canonical_operator_type(op.op_type)
+
+    def refs(values):
+        return [
+            None if value is None else (value if isinstance(value, dict) else {"tensor": value})
+            for value in values
+        ]
+
     spec = {
-        "type": type_to_name(op.op_type),
-        "inputs": op.input_names,
-        "outputs": op.output_names,
+        "type": type_name,
+        "inputs": refs(op.input_names),
+        "outputs": refs(op.output_names),
     }
+    if op.op_type == EOperatorType.ARITHMETIC_COMPOSE:
+        spec["inputs"] = refs(list(op.input_names) + [None] * (10 - len(op.input_names)))
+    elif op.op_type in {EOperatorType.NMS, EOperatorType.SORT_VEC, EOperatorType.SORT_MAT, EOperatorType.SVD, EOperatorType.MICROPHONE}:
+        max_outputs = {EOperatorType.NMS: 3, EOperatorType.SORT_VEC: 2, EOperatorType.SORT_MAT: 2, EOperatorType.SVD: 3, EOperatorType.MICROPHONE: 4}[op.op_type]
+        if op.op_type == EOperatorType.NMS:
+            if len(op.output_names) != 1:
+                raise ValueError("NMS tracing must produce exactly one kept-index output")
+            # The Python helper returns kept indices.  Native NMS reserves
+            # slots 0/1 for scores/boxes and exposes indices at slot 2.
+            spec["outputs"] = refs([None, None, op.output_names[0]])
+        else:
+            spec["outputs"] = refs(list(op.output_names) + [None] * (max_outputs - len(op.output_names)))
+    elif op.op_type == EOperatorType.CAMERA_SPACE_TO_WORLD:
+        spec["outputs"] = refs(list(op.output_names) + [None] * (2 - len(op.output_names)))
+    elif op.op_type == EOperatorType.GET_TRANSFORM_MAT:
+        spec["inputs"] = refs(list(op.input_names) + [None] * (3 - len(op.input_names)))
+    elif op.op_type == EOperatorType.SWITCH_GLTF_RENDER_STATUS:
+        spec["inputs"] = refs(list(op.input_names) + [None] * (4 - len(op.input_names)))
+    elif op.op_type == EOperatorType.UPDATE_GLTF:
+        spec["inputs"] = refs(list(op.input_names) + [None] * (3 - len(op.input_names)))
+    elif op.op_type == EOperatorType.SCENEGRAPH_VISIBILITY:
+        spec["inputs"] = refs(list(op.input_names) + [None] * (2 - len(op.input_names)))
 
     # Add operator-specific fields
     if op.op_type == EOperatorType.ARITHMETIC_COMPOSE and op.attrs:
-        spec["expression"] = op.attrs[0]
+        spec["attrs"] = [op.attrs[0]]
     elif op.op_type == EOperatorType.CONVERT_COLOR and op.attrs:
-        try:
-            spec["flag"] = int(op.attrs[0])
-        except ValueError:
-            spec["flag"] = op.attrs[0]
+        spec["attrs"] = [str(op.attrs[0])]
     elif op.op_type == EOperatorType.NMS and op.attrs:
-        try:
-            spec["threshold"] = float(op.attrs[0])
-        except ValueError:
-            spec["threshold"] = op.attrs[0]
+        spec["attrs"] = [str(op.attrs[0])]
+    elif op.op_type in {EOperatorType.MICROPHONE, EOperatorType.SPEAKER} and op.attrs:
+        spec["attrs"] = [str(op.attrs[0])]
     elif op.op_type == EOperatorType.CUSTOMIZED_COMPARE and op.attrs:
-        spec["comparison"] = op.attrs[0]
+        spec["attrs"] = [op.attrs[0]]
     elif op.op_type == EOperatorType.NORMALIZE:
-        # ``compare``/``mode`` are the active native spellings for their
-        # respective operators.  Normalize's canonical named field is
-        # ``normalize_type``; always emit it because the default L2 mode is
-        # otherwise lost when a traced op has no explicit attrs.
-        spec["normalize_type"] = (op.attrs[0] if op.attrs else "l2").lower()
-    elif _OP_NORM is not None and op.op_type == _OP_NORM and op.attrs:
-        spec["norm_type"] = op.attrs[0]
+        if op.attrs:
+            spec["attrs"] = [op.attrs[0]]
+    # NORM is the legacy magnitude operator and has no serialized mode in
+    # the pipeline spec.  Its traced attrs are an implementation detail and
+    # must not be emitted as the unrelated normalize_type field.
     elif _OP_SORT_MAT is not None and op.op_type == _OP_SORT_MAT and op.attrs:
-        spec["mode"] = op.attrs[0]
+        spec["attrs"] = [str(op.attrs[0])]
     elif _OP_JAVASCRIPT is not None and op.op_type == _OP_JAVASCRIPT and op.attrs:
-        spec["script"] = op.attrs[0]
+        spec["attrs"] = [op.attrs[0]]
+        if op.extra_info.get("input_refs"):
+            spec["inputs"] = refs(op.extra_info["input_refs"])
+        if op.extra_info.get("output_refs"):
+            spec["outputs"] = refs(op.extra_info["output_refs"])
     elif _OP_LOAD_TEXTURE is not None and op.op_type == _OP_LOAD_TEXTURE:
-        if len(op.input_names) >= 2:
-            spec["gltf"] = op.input_names[0]
-            spec["rgb_image"] = op.input_names[1]
+        spec["inputs"] = refs(op.input_names[:2])
     elif _OP_SWITCH_GLTF_RENDER_STATUS is not None and op.op_type == _OP_SWITCH_GLTF_RENDER_STATUS:
-        gltf_index = op.extra_info.get("gltf_input_index", 0)
-        if 0 <= gltf_index < len(op.input_names):
-            spec["gltf"] = op.input_names[gltf_index]
-        for key in ("pose", "view_locked", "visible"):
-            index = op.extra_info.get(f"{key}_input_index")
-            if index is not None and 0 <= index < len(op.input_names):
-                spec[key] = op.input_names[index]
-            else:
-                value = op.extra_info.get(key)
-                if value is not None:
-                    spec[key] = value
+        spec["inputs"] = refs(list(op.input_names[:4]) + [None] * (4 - len(op.input_names)))
     elif _OP_UPDATE_GLTF is not None and op.op_type == _OP_UPDATE_GLTF:
         attribute = op.extra_info.get("attribute") or (op.attrs[0] if op.attrs else "")
-        spec["update_type"] = attribute
-        if op.input_names:
-            spec["gltf"] = op.input_names[0]
-        def input_name(key: str, fallback: int) -> Optional[str]:
-            index = op.extra_info.get(key)
-            if index is not None and 0 <= index < len(op.input_names):
-                return op.input_names[index]
-            return op.input_names[fallback] if fallback < len(op.input_names) else None
-
-        if attribute in {"texture", "gltf_texture"}:
-            if (name := input_name("values_input_index", 1)) is not None:
-                spec["texture_src"] = name
-            if (name := input_name("ids_input_index", 2)) is not None:
-                spec["texture_id"] = name
-        elif attribute == "animation":
-            if (name := input_name("values_input_index", 1)) is not None:
-                spec["animation_id"] = name
-            if (name := input_name("ids_input_index", 2)) is not None:
-                spec["animation_timer"] = name
-        elif attribute in {"world_pose", "pose"}:
-            if (name := input_name("values_input_index", 1)) is not None:
-                spec["pose"] = name
-        elif attribute in {"local_transform", "local_pose"}:
-            if (name := input_name("values_input_index", 1)) is not None:
-                spec["transform"] = name
-            if (name := input_name("ids_input_index", 2)) is not None:
-                spec["node_id"] = name
-        elif len(op.input_names) > 1:
-            if (name := input_name("values_input_index", 1)) is not None:
-                spec["value"] = name
-            if (name := input_name("ids_input_index", 2)) is not None:
-                spec["material_id"] = name
+        spec["attrs"] = [attribute]
+        spec["inputs"] = refs(list(op.input_names[:3]) + [None] * (3 - len(op.input_names)))
     elif _OP_RENDER_TEXT is not None and op.op_type == _OP_RENDER_TEXT:
-        config = op.attrs[0] if op.attrs else "bold#en-us#512#64"
-        parts = config.split("#")
-        spec["typeface"] = op.extra_info.get("typeface", parts[0] if parts else "bold")
-        spec["language_and_locale"] = op.extra_info.get("language_and_locale", parts[1] if len(parts) > 1 else "en-us")
-        spec["canvas_width"] = int(op.extra_info.get("canvas_width", parts[2] if len(parts) > 2 else 512))
-        spec["canvas_height"] = int(op.extra_info.get("canvas_height", parts[3] if len(parts) > 3 else 64))
-        spec["text"] = op.extra_info.get("text", op.attrs[1] if len(op.attrs) > 1 else "")
-        spec["config"] = config
-        gltf_index = op.extra_info.get("gltf_input_index", len(op.input_names) - 1)
-        if op.input_names:
-            spec["gltf"] = op.input_names[gltf_index]
-        for key, field in (("start_input_index", "start"), ("colors_input_index", "colors"),
-                           ("texture_id_input_index", "texture_id"), ("font_size_input_index", "font_size")):
-            index = op.extra_info.get(key)
-            if index is not None and index < len(op.input_names):
-                spec[field] = op.input_names[index]
-            elif op.extra_info.get(field) is not None:
-                spec[field] = op.extra_info[field]
+        if op.attrs:
+            spec["attrs"] = [op.attrs[0]]
+        spec["inputs"] = refs(list(op.input_names[:6]) + [None] * (6 - len(op.input_names)))
     elif op.op_type == EOperatorType.SCENEGRAPH_VISIBILITY:
-        spec["type"] = type_to_name(op.op_type)
-        if op.input_names:
-            spec["scenegraph"] = op.input_names[0]
-        visible_index = op.extra_info.get("visible_input_index")
-        if visible_index is not None and 0 <= visible_index < len(op.input_names):
-            spec["visible"] = op.input_names[visible_index]
-        elif op.extra_info.get("visible") is not None:
-            spec["visible"] = op.extra_info["visible"]
-        elif op.attrs:
-            spec["visible"] = _parse_bool_or_tensor(op.attrs[0])
+        spec["inputs"] = refs(list(op.input_names[:2]) + [None] * (2 - len(op.input_names)))
         spec["outputs"] = []
     elif op.op_type == EOperatorType.UPDATE_COMPONENT:
-        spec["type"] = type_to_name(op.op_type)
         if op.input_names:
-            spec["scenegraph"] = op.input_names[0]
-        if len(op.input_names) > 1:
-            spec["data"] = op.input_names[1]
-        if "entity_path" in op.extra_info:
-            spec["entity_path"] = op.extra_info["entity_path"]
-        if "property" in op.extra_info:
-            spec["property"] = op.extra_info["property"]
+            spec["inputs"] = refs(op.input_names[:2])
+        entity_path = op.extra_info.get("entity_path")
+        property_name = op.extra_info.get("property") or op.extra_info.get("target_property")
+        if entity_path and property_name:
+            spec["attrs"] = [f"{entity_path}:{property_name}"]
         spec["outputs"] = []
     elif _OP_RUN_MODEL_INFERENCE is not None and op.op_type == _OP_RUN_MODEL_INFERENCE:
         if "model" in op.extra_info:
@@ -248,11 +221,15 @@ def _op_to_spec(op: TracedOp) -> Dict[str, Any]:
             if spec["model"].get("model_target") != "cpu":
                 spec["model"].pop("cpu_target_num_threads", None)
         if op.extra_info.get("input_refs"):
-            spec["inputs"] = op.extra_info["input_refs"]
+            spec["inputs"] = refs(op.extra_info["input_refs"])
         if op.extra_info.get("output_refs"):
-            spec["outputs"] = op.extra_info["output_refs"]
+            spec["outputs"] = refs(op.extra_info["output_refs"])
     elif op.op_type == EOperatorType.ASSIGNMENT:
-        for field in ("src_slices", "dst_slices", "src_slices_tensor", "dst_slices_tensor", "src_channel_slice", "dst_channel_slice"):
+        # Strict package JSON represents assignment as src -> dst.  The trace
+        # records the destination array as an execution input as well, but it
+        # is represented by the recorded result/output in the package graph.
+        spec["inputs"] = refs(op.input_names[:1])
+        for field in ("src_slices", "dst_slices", "src_channel_slice", "dst_channel_slice"):
             if field in op.extra_info:
                 spec[field] = op.extra_info[field]
 
@@ -282,10 +259,117 @@ def trace_to_pipeline_spec(ctx: TraceContext) -> Dict[str, Any]:
     for name, info in ctx.tensors.items():
         tensors[name] = _tensor_info_to_spec(info)
 
+    # The native CHW/HWC loader distinguishes the layouts by rank: HWC is a
+    # 2D MAT with channels, while CHW is a 3D one-channel MAT.  Trace arrays
+    # carry the channel axis in both NumPy shapes, so normalize the serialized
+    # descriptors around each swap operation.
+    if _OP_SWAP_HWC_CHW is not None:
+        for op in ctx.operations:
+            if op.op_type != _OP_SWAP_HWC_CHW or not op.input_names or not op.output_names:
+                continue
+            source_info = ctx.tensors.get(op.input_names[0])
+            result_info = ctx.tensors.get(op.output_names[0])
+            if source_info is None or result_info is None or len(source_info.shape) != 3 or len(result_info.shape) != 3:
+                continue
+            source_spec = tensors[op.input_names[0]]
+            result_spec = tensors[op.output_names[0]]
+            source_spec["dimensions"] = [int(source_info.shape[0]), int(source_info.shape[1])]
+            source_spec["channels"] = int(source_info.shape[2])
+            source_spec["usage"] = int(TensorType.MAT.value)
+            result_spec["dimensions"] = [int(result_info.shape[0]), int(result_info.shape[1]), int(result_info.shape[2])]
+            result_spec["channels"] = 1
+            result_spec["usage"] = int(TensorType.MAT.value)
+
     # Build operator specs
     operators = []
     for op in ctx.operations:
         operators.append(_op_to_spec(op))
+
+    def set_tensor_layout(
+        name: str, *, dimensions: List[int], channels: int, usage: int, is_gltf: bool = False
+    ) -> None:
+        tensor = tensors.get(name)
+        if tensor is None:
+            return
+        tensor["dimensions"] = dimensions
+        tensor["channels"] = channels
+        tensor["usage"] = usage
+        if is_gltf:
+            tensor["is_gltf"] = True
+            tensor["is_placeholder"] = True
+        tensor.pop("flag", None)
+
+    # Normalize trace arrays to the non-MAT tensor forms required by OpenMR.
+    for op in ctx.operations:
+        if op.op_type == EOperatorType.UV_TO_3D_IN_CAM_SPACE and op.input_names:
+            info = ctx.tensors.get(op.input_names[0])
+            if info is not None and int(np.prod(info.shape)) % 2 == 0:
+                set_tensor_layout(
+                    op.input_names[0], dimensions=[int(np.prod(info.shape)) // 2],
+                    channels=2, usage=int(TensorType.POINT.value),
+                )
+        if op.op_type in {
+            EOperatorType.LOAD_TEXTURE, EOperatorType.SWITCH_GLTF_RENDER_STATUS,
+            EOperatorType.UPDATE_GLTF, EOperatorType.SCENEGRAPH_VISIBILITY,
+            EOperatorType.UPDATE_COMPONENT,
+        } and op.input_names:
+            set_tensor_layout(
+                op.input_names[0], dimensions=[1, 1], channels=1,
+                usage=int(TensorType.GLTF.value), is_gltf=True,
+            )
+        if op.op_type == EOperatorType.LOAD_TEXTURE and op.output_names:
+            set_tensor_layout(
+                op.output_names[0], dimensions=[1], channels=1,
+                usage=int(TensorType.SCALAR.value),
+            )
+        if op.op_type == EOperatorType.UPDATE_GLTF and len(op.input_names) >= 2:
+            attribute = op.attrs[0] if op.attrs else ""
+            if attribute != "world pose":
+                set_tensor_layout(
+                    op.input_names[1], dimensions=[int(np.prod(ctx.tensors[op.input_names[1]].shape))],
+                    channels=1, usage=int(TensorType.SCALAR.value),
+                )
+            if len(op.input_names) >= 3 and attribute in {
+                "animation", "material::metallic_factor", "material::roughness_factor",
+                "material::metallic_roughness_texture", "material::base_color_factor",
+                "material::base_color_texture", "material::normal_map_texture",
+                "material::occlusion_texture", "material::emissive_factor",
+                "material::emissive_strength", "material::emissive_texture",
+            }:
+                value_info = ctx.tensors[op.input_names[2]]
+                value_count = int(np.prod(value_info.shape))
+                channels = 4 if attribute in {
+                    "material::base_color_factor", "material::emissive_factor"
+                } else 1
+                set_tensor_layout(
+                    op.input_names[2], dimensions=[max(value_count // channels, 1)],
+                    channels=channels, usage=int(TensorType.SCALAR.value),
+                )
+            if len(op.input_names) >= 3 and attribute == "local":
+                transform_info = ctx.tensors[op.input_names[2]]
+                transform_shape = list(transform_info.shape)
+                if transform_shape == [4, 4] or (
+                    len(transform_shape) == 3 and transform_shape[1:] == [4, 4]
+                ):
+                    set_tensor_layout(
+                        op.input_names[2], dimensions=transform_shape, channels=1,
+                        usage=int(TensorType.MAT.value),
+                    )
+        if op.op_type == EOperatorType.RENDER_TEXT and len(op.input_names) >= 6:
+            set_tensor_layout(
+                op.input_names[1], dimensions=[1], channels=2, usage=int(TensorType.POINT.value)
+            )
+            set_tensor_layout(
+                op.input_names[2], dimensions=[2], channels=4, usage=int(TensorType.COLOR.value)
+            )
+            set_tensor_layout(
+                op.input_names[3], dimensions=[1, 1], channels=1,
+                usage=int(TensorType.GLTF.value), is_gltf=True,
+            )
+            for name in (op.input_names[4], op.input_names[5]):
+                set_tensor_layout(
+                    name, dimensions=[1], channels=1, usage=int(TensorType.SCALAR.value)
+                )
 
     # Determine inputs and outputs
     inputs = [name for name, info in ctx.tensors.items() if info.is_input]
@@ -380,7 +464,7 @@ def trace_to_pipeline_spec(ctx: TraceContext) -> Dict[str, Any]:
                     except Exception:
                         pass
 
-    # Fix up tensor specs for solve_pnp inputs (expects channelized point arrays).
+    # Fix up tensor specs for solve_p_n_p inputs (expects channelized point arrays).
     if _OP_SOLVE_PNP is not None:
         for op in ctx.operations:
             if op.op_type != _OP_SOLVE_PNP or len(op.input_names) < 2:

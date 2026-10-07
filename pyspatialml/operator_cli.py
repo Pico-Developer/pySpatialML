@@ -24,6 +24,13 @@ from typing import Any, Mapping, Optional
 
 from securemr.core.types import EOperatorType
 from securemr.py2smr import ops
+from securemr.operator_contracts import (
+    DYNAMIC_INPUT_OPERATORS,
+    DYNAMIC_OUTPUT_OPERATORS,
+    INTERNAL_OPERATOR_NAMES,
+    input_switches,
+    output_switches,
+)
 
 
 class OperatorCliError(RuntimeError):
@@ -40,8 +47,10 @@ class OperatorInfo:
     signature: Optional[str]
     summary: str
     supported: bool
-    native_default_loader_supported: bool
-    requires_custom_handler: bool
+    input_switches: tuple[str, ...]
+    dynamic_inputs: bool
+    output_switches: tuple[str, ...]
+    dynamic_outputs: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -51,8 +60,10 @@ class OperatorInfo:
             "signature": self.signature,
             "summary": self.summary,
             "supported": self.supported,
-            "native_default_loader_supported": self.native_default_loader_supported,
-            "requires_custom_handler": self.requires_custom_handler,
+            "input_switches": list(self.input_switches),
+            "dynamic_inputs": self.dynamic_inputs,
+            "output_switches": list(self.output_switches),
+            "dynamic_outputs": self.dynamic_outputs,
         }
 
 
@@ -68,18 +79,18 @@ _OPERATOR_CREATORS: Mapping[str, str] = {
     "ALL": "all",
     "ANY": "any",
     "NMS": "nms",
-    "SOLVE_P_N_P": "solve_pnp",
+    "SOLVE_P_N_P": "solve_p_n_p",
     "GET_AFFINE": "get_affine",
     "APPLY_AFFINE": "apply_affine",
     "APPLY_AFFINE_POINT": "apply_affine_point",
-    "UV_TO_3D_IN_CAM_SPACE": "uv_to_3d_in_cam_space",
+    "UV_TO_3D_IN_CAM_SPACE": "uv_to_3d_in_camera_space",
     "ASSIGNMENT": "assignment",
-    "RUN_MODEL_INFERENCE": "run_model_inference",
+    "RUN_MODEL_INFERENCE": "run_algorithm",
     "NORMALIZE": "normalize",
     "CAMERA_SPACE_TO_WORLD": "camera_space_to_world",
-    "RECTIFIED_VST_ACCESS": "rectified_vst_access",
+    "RECTIFIED_VST_ACCESS": "camera_access",
     "ARGMAX": "argmax",
-    "CONVERT_COLOR": "convert_color",
+    "CONVERT_COLOR": "cvt_color",
     "SORT_VEC": "sort_vec",
     "INVERSION": "inversion",
     "GET_TRANSFORM_MAT": "get_transform_mat",
@@ -98,17 +109,18 @@ _OPERATOR_CREATORS: Mapping[str, str] = {
     "SPEAKER": "speaker",
     "DEPTH": "depth",
 }
-
-# These creators are useful for authoring and host stubs, but the default
-# SpatialSDK package loader routes them through customOperatorHandler.
-_CUSTOM_HANDLER_ONLY = frozenset({
-    "CAMERA_SPACE_TO_WORLD",
-    "LOAD_TEXTURE",
-    "SWITCH_GLTF_RENDER_STATUS",
-    "UPDATE_GLTF",
-    "RENDER_TEXT",
-})
-
+_CANONICAL_OPERATOR_NAMES: Mapping[str, str] = {
+    internal: canonical for canonical, internal in INTERNAL_OPERATOR_NAMES.items()
+}
+_CANONICAL_CREATOR_ALIASES: Mapping[str, str] = {
+    "CHW_HWC": "swap_hwc_chw",
+    "MAKE_TRANSFORM_MAT": "get_transform_mat",
+    "UPLOAD_TEXTURE_TO_GLTF": "load_texture",
+    "SSMR_SWITCH_VISIBILITY": "scenegraph_visibility",
+    "SSMR_UPDATE_COMPONENT": "update_component",
+    "JS_SCRIPTING": "javascript",
+}
+_LEGACY_OPERATOR_NAMES = frozenset(_CANONICAL_OPERATOR_NAMES)
 
 def list_operators(*, as_json: bool = False) -> int:
     """Print discoverable operators."""
@@ -120,11 +132,7 @@ def list_operators(*, as_json: bool = False) -> int:
     for item in operators:
         marker = "yes" if item.supported else "no"
         creator = item.creator or "-"
-        loader_support = "yes" if item.native_default_loader_supported else "no"
-        print(
-            f"  {item.enum_name:<32} creator={creator:<28} "
-            f"supported={marker} native_loader={loader_support}"
-        )
+        print(f"  {item.enum_name:<32} creator={creator:<28} supported={marker}")
     return 0
 
 
@@ -140,12 +148,14 @@ def describe_operator(name: str, *, as_json: bool = False) -> int:
     print(f"Type: {info.type_name}")
     print(f"Creator: {info.creator or '-'}")
     print(f"Supported: {'yes' if info.supported else 'no'}")
-    print(
-        f"Native default loader supported: "
-        f"{'yes' if info.native_default_loader_supported else 'no'}"
-    )
-    if info.requires_custom_handler:
-        print("Requires downstream custom handler: yes")
+    if info.dynamic_inputs:
+        print("Input switches: dynamic (--NAME TENSOR or --named-input NAME=TENSOR)")
+    else:
+        print(f"Input switches: {', '.join(info.input_switches) or '-'}")
+    if info.dynamic_outputs:
+        print("Output switches: dynamic (--named-output NAME=TENSOR)")
+    else:
+        print(f"Output switches: {', '.join(info.output_switches) or '-'}")
     if info.signature:
         print(f"Signature: {info.signature}")
     if info.summary:
@@ -156,8 +166,16 @@ def describe_operator(name: str, *, as_json: bool = False) -> int:
 def discover_operators() -> list[OperatorInfo]:
     """Return all enum-backed operators with py2smr creator metadata."""
     result = []
+    emitted_names = set()
     for enum_name in _enum_names():
-        creator = _OPERATOR_CREATORS.get(enum_name)
+        canonical_name = _CANONICAL_OPERATOR_NAMES.get(enum_name, enum_name)
+        # EOperatorType is an internal/native enum and still contains the
+        # historical spellings.  They are translated once at this boundary;
+        # never expose those spellings as package-facing operator names.
+        if canonical_name in emitted_names:
+            continue
+        emitted_names.add(canonical_name)
+        creator = _CANONICAL_CREATOR_ALIASES.get(canonical_name, _OPERATOR_CREATORS.get(enum_name))
         fn = getattr(ops, creator, None) if creator else None
         signature = None
         summary = ""
@@ -169,14 +187,16 @@ def discover_operators() -> list[OperatorInfo]:
             summary = _doc_summary(fn)
         result.append(
             OperatorInfo(
-                enum_name=enum_name,
-                type_name=f"XR_SECURE_MR_OPERATOR_TYPE_{enum_name}_PICO",
+                enum_name=canonical_name,
+                type_name=f"XR_SECURE_MR_OPERATOR_TYPE_{canonical_name}_PICO",
                 creator=creator,
                 signature=signature,
                 summary=summary,
                 supported=fn is not None,
-                native_default_loader_supported=enum_name not in _CUSTOM_HANDLER_ONLY,
-                requires_custom_handler=enum_name in _CUSTOM_HANDLER_ONLY,
+                input_switches=input_switches(canonical_name),
+                dynamic_inputs=canonical_name in DYNAMIC_INPUT_OPERATORS,
+                output_switches=output_switches(canonical_name),
+                dynamic_outputs=canonical_name in DYNAMIC_OUTPUT_OPERATORS,
             )
         )
     return result
@@ -185,6 +205,10 @@ def discover_operators() -> list[OperatorInfo]:
 def find_operator(name: str) -> Optional[OperatorInfo]:
     """Resolve operator by enum name, JSON type name, or creator name."""
     normalized = _normalize_name(name)
+    # Do not canonicalize legacy input here.  That would make an old alias
+    # appear supported even though strict schema packages must not contain it.
+    if normalized in _LEGACY_OPERATOR_NAMES:
+        return None
     for item in discover_operators():
         if normalized in {
             _normalize_name(item.enum_name),

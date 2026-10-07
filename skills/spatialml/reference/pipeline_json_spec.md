@@ -19,6 +19,14 @@ Pipeline packages include a root `manifest.json` that points at pipeline JSON an
 Allowed execution mode values are `xr` and `spatial`. Include only the modes supported by the operators and assets in that package.
 Schema version 2 removes manifest-level `model` / `models` entries and external model metadata JSON files.
 
+### Package-Relative Paths
+
+Paths stored in a packaged pipeline must be relative to the package root. This
+includes manifest pipeline entries, model `bin_path` values, and tensor `asset`
+values. Paths must not be absolute or escape the package with `..` traversal.
+Source files supplied to packaging tools may use host filesystem paths; the
+generated package records the copied assets using package-relative paths.
+
 Most operators are valid in both modes. The current mode-specific exceptions are:
 
 | Operator type | XR mode | Spatial mode | Notes |
@@ -26,9 +34,9 @@ Most operators are valid in both modes. The current mode-specific exceptions are
 | `XR_SECURE_MR_OPERATOR_TYPE_SWITCH_GLTF_RENDER_STATUS_PICO` | yes | no | GLTF rendering path. |
 | `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_GLTF_PICO` | yes | no | GLTF rendering path. |
 | `XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO` | yes | no | GLTF/text rendering path. |
-| `XR_SECURE_MR_OPERATOR_TYPE_LOAD_TEXTURE_PICO` | yes | no | GLTF texture upload path. |
-| `XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO` | no | yes | Spatial scenegraph path. |
-| `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO` | no | yes | Spatial component update path. |
+| `XR_SECURE_MR_OPERATOR_TYPE_UPLOAD_TEXTURE_TO_GLTF_PICO` | yes | no | GLTF texture upload path. |
+| `XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO` | no | yes | Spatial scenegraph path. |
+| `XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO` | no | yes | Spatial component update path. |
 
 ## Tensor Descriptors
 
@@ -40,15 +48,19 @@ Every tensor entry under `tensors` is an object with the following fields (`secu
 | `channels`     | int                  | Number of channels per element. |
 | `data_type`    | int                  | Encodes `XrSecureMrTensorDataTypePICO`; see table below. |
 | `is_placeholder` | bool              | Placeholders are allocated externally and become pipeline IO. |
-| `usage`        | int                  | Raw `XrSecureMrTensorTypePICO` value (e.g. 6 for MAT, 2 for OUTPUT). |
+| `usage`        | int                  | Numeric `XrSecureMrTensorTypePICO` value (e.g. 6 for MAT, 2 for OUTPUT). String usage names are unsupported. |
 | `flag`         | int (optional)       | Bitmask combining data type with `smr.BaseType` modifiers (`smr.BaseType.MAT`, channel bits, etc.). |
-| `data` / `value` | array\<number> (optional) | Flattened tensor contents for preload. `data` and `value` are synonyms (`SecureMR_Samples/base/securemr_utils/serialization.cpp:340-414`). |
+| `data`        | array\<number> (optional) | Flattened tensor contents for preload. |
 | `is_gltf`      | bool (optional)      | Marks GLTF placeholders that skip numeric attributes (`serialization.cpp:483-488`). |
-| `tensor_type`  | string (optional)    | Shorthand accepted by package loaders for special tensors. Known values include `timestamp`, `gltf`, `scalar_array`, `point2_array`, `point3_array`, and `rgba_array`. |
-| `size`         | int (optional)       | Element count for special tensor shorthand such as `point2_array`, `point3_array`, and `scalar_array`. |
-| `asset`        | string (optional)    | Package-relative asset path for `tensor_type: "gltf"` tensors. Package loaders use it to materialize scene graph tensors from GLTF assets. |
+| `asset`        | string (optional)    | Package-relative asset path for GLTF tensors. Package loaders use it to materialize scene graph tensors from GLTF assets. |
 
-Rule: tensors declared with MAT/matrix usage (`usage: 6`, `usage: "matrix"`, or `tensor_type: "matrix"`) must have at least two entries in `dimensions`. Use `[1, N]` or `[N, 1]` for vector-shaped matrix data; use scalar/point tensor usage for true one-dimensional scalar or point arrays.
+Usage-specific shape and channel rules are part of the descriptor contract: scalar tensors use one dimension and one channel; point tensors use one dimension and two or three channels; color tensors use one dimension, three or four channels, and UINT8 data; timestamp tensors use `dimensions: [1]`, four channels, and INT32 data; slice tensors use one dimension, two or three channels, and INT32 data.
+
+`usage` must be an integer code. For MAT/matrix tensors (`usage: 6`), the
+tensor must have at least two entries in `dimensions`. Use `[1, N]` or `[N, 1]`
+for vector-shaped matrix data; use the appropriate numeric `usage`,
+`dimensions`, and `channels` values for true one-dimensional scalar or point
+arrays.
 
 ### Data Type Codes
 
@@ -64,13 +76,14 @@ Python exposes explicit mappings (`securemr/serialization.py:44-73`):
 | 6    | `np.float32`| `FLOAT32` |
 | 7    | `np.float64`| `FLOAT64` |
 
-`convert_from_dtype` and `convert_to_dtype` convert between numeric codes, numpy dtypes, and `smr.EDataType`.
-Package loaders may also accept string aliases for convenience, including `uint8`, `int8`, `uint16`, `int16`, `int32`, `float32`, `fp32`, `float64`, and `double`.
+`data_type` must use one of the numeric codes in the table above.
 
 ### Placeholder Semantics
 
-- During save the Python helper normalizes `is_placeholder` so only tensors referenced in `inputs` or `outputs` remain placeholders (`securemr/serialization.py:528-535`).
-- The C++ loader instantiates placeholders or allocates locals accordingly and preloads data when provided (`serialization.cpp:479-499`).
+- `is_placeholder: true` declares a pipeline tensor whose storage must be supplied by a compatible global tensor binding before execution. The loader rejects a submitted pipeline if any placeholder is left unbound.
+- Tensors listed in the top-level `inputs` or `outputs` arrays must therefore be declared as placeholders. These arrays also define package-boundary ordering for runners and multi-pipeline composition.
+- A placeholder does not necessarily need to appear in `inputs` or `outputs` when the loader provides another binding mechanism. For example, the XR loader binds GLTF placeholders from their package `asset`, and may bind tensors identified by runtime metadata.
+- `is_placeholder: false` declares pipeline-local storage. A local numeric tensor may be initialized using its `data` field.
 
 ## Inline Model Metadata
 
@@ -87,16 +100,14 @@ Model inference operators carry their model metadata inline under the operator `
     {
       "name": "image",
       "shape": [1, 256, 256, 3],
-      "encoding_type": "FP32",
-      "alias_name": "image"
+      "encoding_type": "FP32"
     }
   ],
   "output": [
     {
       "name": "output",
       "shape": [1, 1],
-      "encoding_type": "FP32",
-      "alias_name": "output"
+      "encoding_type": "FP32"
     }
   ]
 }
@@ -115,7 +126,6 @@ Model metadata fields are:
 | `input[].name` / `output[].name` | string | Model graph node name. |
 | `input[].shape` / `output[].shape` | array\<int> | Model tensor shape in model-runtime order. |
 | `input[].encoding_type` / `output[].encoding_type` | string | Encoding such as `FP32`, `UINT8`, or other runtime-supported encodings. |
-| `input[].alias_name` / `output[].alias_name` | string (optional) | Alias used by package generation and model-node binding helpers. |
 
 ## Operator Entries
 
@@ -124,237 +134,232 @@ Common fields for every operator entry:
 | Key        | Type          | Notes |
 |------------|---------------|-------|
 | `type`     | string        | Canonical `XR_SECURE_MR_OPERATOR_TYPE_*_PICO` enumerant name. |
-| `inputs`   | array         | Positional tensor references. Elements may be strings or objects containing a `tensor` key; both forms are accepted by the loader (`serialization.cpp:379-425`). |
+| `inputs`   | array         | Positional tensor-reference objects. Each element must contain a `tensor` key and may contain an optional `name` binding. |
 | `outputs`  | array         | Same rules as `inputs`. |
-| `attrs`    | array\<string> (optional) | Raw attribute strings. Python may promote well-known entries to named keys such as `flag`, `expression`, or `threshold` (`securemr/serialization.py:336-353`). |
+| `attrs`    | array\<string> (optional) | Operator configuration strings. Use this field for any operator-specific configuration. |
+
+Every `inputs` and `outputs` entry uses the same object form:
+
+```json
+{
+  "tensor": "package_tensor",
+  "name": "logical_name"
+}
+```
+
+`tensor` identifies the package tensor. `name` is optional and identifies a
+model or JavaScript input/output when that logical name differs from the
+package tensor name. Array position still determines the operator slot.
+
+The short string form such as `"image"` is not part of the package JSON form.
 
 ### Operator Dictionary by `type`
 
-Below lists the supported operators observed in the serializers together with the pipeline helpers that back them. Entries that the default loader does not yet recognize must be handled through `PipelineDeserializationOptions::customOperatorHandler` (until the missing branch is added).
+The bullets below describe the package-facing operator contract. Operator-specific
+configuration is provided through `attrs`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO` (`camera_access`)
-- Sets up the rectified VST capture operator; entries are injected by the Python helper (`securemr/serialization.py:554-603`).
-- Expect exactly four outputs in order: right RGB, left RGB, timestamp, camera matrix (`serialization.cpp:572-579`).
-- Provide placeholder tensors sized per the SecureMR spec; the loader validates all four outputs.
-- No inputs, attributes, or alternate keys; the alias `camera_access` maps to `RECTIFIED_VST_ACCESS`.
+#### `XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO`
+- Positional signature: 0 inputs and 4 results. The results are ordered and named `right image`, `left image`, `timestamp`, and `camera matrix`.
+- `right image` and `left image` are UINT8, 3- or 4-channel, 2D MAT tensors. Their dimensions normally match the VST session; a mismatch can cause runtime resizing.
+- `timestamp` is a 4-channel INT32 VEC with shape `{1}`.
+- `camera matrix` is a 1-channel FLOAT32/FLOAT64 3×3 MAT.
+- It is Android-only and requires camera access.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_CAMERA_SPACE_TO_WORLD_PICO` (`camera_space_to_world`)
-- Wraps `Pipeline::camSpace2XrLocal` and issues `XR_SECURE_MR_OPERATOR_TYPE_CAMERA_SPACE_TO_WORLD_PICO`.
-- Supply the timestamp tensor from `camera_access` as `inputs[0]`; no other inputs are used.
-- `outputs[0]` returns the right-eye 4×4 transform, `outputs[1]` (optional) returns the left-eye transform.
-- Not yet wired into `serialization.cpp`; extend the loader or rely on a custom handler before round-tripping JSON.
+#### `XR_SECURE_MR_OPERATOR_TYPE_CAMERA_SPACE_TO_WORLD_PICO`
+- Positional signature: 1 input and 2 result slots. Input 0 is the timestamp operand, a 4-channel INT32 VEC with shape `{1}`.
+- Input 0 is the timestamp tensor; JSON package connections remain positional through `inputs[0]`.
+- Result 0 is `right`; result 1 is optional `left`. Each provided result must be a 1-channel floating-point 4×4 MAT.
+- Result names are `right` and `left`; JSON package connections remain positional through `outputs[0]` and optional `outputs[1]`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO` (`uv_to_3d_in_cam_space`)
-- Implements `Pipeline::uv2Cam` (`XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO`) to lift UVs into 3D camera space.
-- Requires five inputs ordered as UV coordinates, timestamp, camera matrix, left RGB image, right RGB image.
-- `outputs[0]` stores the 3-channel floating-point point cloud; shape must mirror the UV tensor.
-- The shipped loader lacks this branch; reuse tensors produced by `camera_access` and handle deserialization manually for now.
+#### `XR_SECURE_MR_OPERATOR_TYPE_UV_TO_3D_IN_CAM_SPACE_PICO`
+- Positional signature: 5 inputs and 1 result: `uv`, `timestamp`, `camera intrinsic`, `left image`, `right image`.
+- `uv` is a 2-channel Point tensor. `timestamp` is a 4-channel VEC. `camera intrinsic` is a 3×3 MAT. Both image inputs are MAT tensors.
+- The result is floating-point and must represent one 3D point per UV. Accepted layouts include a Point3 tensor, a 1-channel MAT shaped `{N,3}` or `{3,1}` for `N == 1`, or a 3-channel MAT shaped `{N,1}` or `{1,N}`.
+- This operator is unavailable on emulators because depth data is unavailable.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_GET_AFFINE_PICO` (`get_affine`)
-- Supports inline arrays (`src_points`/`dst_points`) or tensor inputs to describe the three source and destination points (`serialization.cpp:584-613`).
-- `outputs[0]` must be a 2×3 float MAT representing the affine transform.
-- The loader resolves point tensors from inlined tensor `value` fields when needed.
-- No extra attributes beyond the optional point arrays.
+#### `XR_SECURE_MR_OPERATOR_TYPE_GET_AFFINE_PICO`
+- Positional signature: 2 inputs (`src`, `dst`) and 1 result (`result`).
+- `src` and `dst` are floating-point, 2-channel point data with exactly three total points, represented as a one-dimensional `{3}` tensor or a 2D tensor with three total elements.
+- `result` is a 1-channel MAT with shape `2×3`.
+- Inline point arrays and tensor/value conversion are loader behavior, not part of the operator contract.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_APPLY_AFFINE_PICO` (`apply_affine`)
-- Mirrors `Pipeline::applyAffine` (`XR_SECURE_MR_OPERATOR_TYPE_APPLY_AFFINE_PICO`) for image warps.
-- `inputs[0]` supplies the 2×3 affine matrix and `inputs[1]` the source image tensor (`serialization.cpp:617-622`).
-- `outputs[0]` receives the warped image; dimensions and channels must match the source tensor.
-- No attributes or auxiliary keys are required.
+#### `XR_SECURE_MR_OPERATOR_TYPE_APPLY_AFFINE_PICO`
+- Positional signature: 2 inputs (`affine`, `src image`) and 1 result (`dst image`).
+- `affine` is a 1-channel MAT of shape `2×3`. `src image` and `dst image` are MAT tensors with 2D shapes; the result dimensions are the destination image dimensions.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_APPLY_AFFINE_POINT_PICO` (`apply_affine_point`)
-- Wraps `Pipeline::applyAffinePoint` to transform point arrays with the same affine matrix.
-- Provide the affine matrix and the input point tensor as the two inputs; the first output carries transformed points.
-- Ensure the result tensor has identical element count and channel layout as the input point tensor.
-- Deserialization support is pending; hook it up via a custom handler until `serialization.cpp` gains this case.
+#### `XR_SECURE_MR_OPERATOR_TYPE_APPLY_AFFINE_POINT_PICO`
+- Positional signature: 2 inputs (`affine`, `src points`) and 1 result (`dst points`).
+- `affine` is a 1-channel MAT of shape `2×3`. Point tensors are floating-point, 2-channel, and one-dimensional or 2D vector-shaped. The result uses the corresponding floating-point 2-channel point layout.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO` (`assignment`)
-- `inputs[0]` is the source tensor and `outputs[0]` the destination (`serialization.cpp:623-762`).
-- Use `src_slices` / `dst_slices` arrays for static `[start, end[, step]]` slicing; shape must match tensor rank.
-- `src_slices_tensor` / `dst_slices_tensor` name tensors that hold slice descriptors (mutually exclusive with the inline arrays).
-- `src_channel_slice` / `dst_channel_slice` narrow channels with 1–3 integers; omit all slice keys for full-tensor copies.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO`
+- The only supported JSON form uses `inputs[0]` for `src` and `outputs[0]` for `dst`.
+- Slicing, when used, must be specified with the named fields `src_slices`, `dst_slices`, `src_channel_slice`, and `dst_channel_slice`. Dimension slice fields are arrays containing one to three integers per dimension (`start`, `end`, optional `step`); channel slice fields contain one to three integers.
+- For example:
+  ```json
+  {
+    "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
+    "inputs": [{"tensor": "src"}],
+    "outputs": [{"tensor": "dst"}],
+    "src_slices": [[0, 10]],
+    "dst_slices": [[5, 15]]
+  }
+  ```
+- Omitting the slice fields performs a full copy. Assignment also performs element-wise type conversion when the selected source and destination regions differ in data type.
+- Bracketed tensor references such as `src[0:10]` and `dst[5:15]`, and separate positional slice-tensor inputs, are unsupported and must not be used.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO` (`customized_compare`)
-- Backed by `Pipeline::compareTo` (`XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO`) to compare two tensors element-wise.
-- `inputs[0]` and `inputs[1]` are the left/right operands; they must share the same shape and channel count.
-- Provide the comparator via `comparison` (one of `">"`, `"<"`, `"=="`, `">="`, `"<="`, `"!="`) or fall back to `attrs[0]`, matching `securemr_operators.md` §4.
-- `outputs[0]` stores the boolean/int result; add loader support before relying on automatic deserialization.
+#### `XR_SECURE_MR_OPERATOR_TYPE_CUSTOMIZED_COMPARE_PICO`
+- Positional signature: 2 inputs and 1 result. Inputs 0 and 1 are the compared tensors; result 0 is the integer comparison result.
+- Inputs and result must have matching dimensions and channel counts. The result must be an integer tensor.
+- `attrs[0]` must contain one comparator: `==`, `!=`, `>`, `>=`, `<`, or `<=`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ALL_PICO` (`all`)
-- Adds `XR_SECURE_MR_OPERATOR_TYPE_ALL_PICO` through `Pipeline::all` to reduce a tensor with logical AND.
-- `inputs[0]` accepts any boolean-compatible tensor; `outputs[0]` is a vector whose channel count is either 1 or matches the operand.
-- Reduction runs per channel when the result shares the operand’s channel count; otherwise all channels collapse into a single value.
-- Currently missing in `serialization.cpp`; require a custom handler for JSON round-tripping.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ALL_PICO`
+- Positional signature: 1 input and 1 result. The input may be any tensor.
+- The result must be an integer, 1-channel VEC with shape `{1}`. It is a whole-tensor logical AND reduction; there is no per-channel result form.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ANY_PICO` (`any`)
-- Builds on `Pipeline::any` for `XR_SECURE_MR_OPERATOR_TYPE_ANY_PICO`, reducing with logical OR.
-- The wiring mirrors `all`: single operand tensor and a scalar or per-channel result tensor.
-- Use this to detect whether any element is non-zero while preserving channel grouping when desired.
-- Needs explicit loader support or custom handling because the default deserializer does not parse this type yet.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ANY_PICO`
+- Positional signature and result requirements are the same as `all`: one input and one integer, 1-channel VEC result with shape `{1}`.
+- The operation is a whole-tensor logical OR/non-zero reduction; there is no optional per-channel result form.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ARGMAX_PICO` (`argmax`)
-- Wraps `Pipeline::argMax` to expose `XR_SECURE_MR_OPERATOR_TYPE_ARGMAX_PICO`.
-- Single operand at `inputs[0]`; `outputs[0]` stores per-channel indices of the maximal element as integers.
-- Result tensors typically use MAT usage with one channel (indices) unless you mirror the operand’s channels.
-- Absent in `serialization.cpp`; extend the loader before serializing/deserializing this operator.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ARGMAX_PICO`
+- Positional signature: 1 input and 1 result.
+- The input may use the supported numeric data types. The result must be an integer tensor.
+- The result channel count must equal the input dimensionality, and the total result element count must equal the input channel count. This is a channel-wise argmax, not simply a one-channel MAT result.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO` (`cvt_color`)
-- Mirrors `Pipeline::cvtColor` (`XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO`) to run OpenCV color conversions.
-- `inputs[0]` is the source image; `outputs[0]` is the destination (`serialization.cpp:763-769`).
-- Provide the OpenCV code via `flag` or `attrs[0]`; the helper casts numeric strings to ints (`securemr/serialization.py:336-344`).
-- Ensure tensor shape, channel count, and data type align with the requested conversion.
+#### `XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO`
+- Positional signature: 1 input (`src`) and 1 result (`dst`), with no nullable slots.
+- Both tensors must be MAT tensors. The conversion is performed by OpenCV `cvtColor`.
+- `attrs[0]` must contain the numeric OpenCV color-conversion enum.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO` (`type_convert`)
-- Exposed through `Pipeline::typeConvert` (delegates to assignment) for format changes.
-- The loader auto-detects this path when input and output tensor data types differ and no slicing is specified (`serialization.cpp:623-654`).
-- Use when only the tensor data type differs; dimensions and channels must still match.
-- No attributes or inline configuration are required.
+#### `XR_SECURE_MR_OPERATOR_TYPE_NORMALIZE_PICO`
+- Positional signature: 2 input slots (`source`/input 0 and optional `alpha_beta`/input 1) and 1 result.
+- `alpha_beta`, when present, contains exactly two floating-point values: alpha and beta. It may be a floating-point VEC or another compatible two-value tensor.
+- The source and result must have the same tensor type, rank, and shape. MAT, tensor-array MAT, and compatible scalar/point/tensor forms are supported by the implementation.
+- `attrs` may be omitted or contain one value: `L1`, `L2` (default), `INF`, or `MINMAX`. Attribute matching is case-sensitive.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_NORMALIZE_PICO` (`normalize`)
-- Wraps `Pipeline::normalize` (`XR_SECURE_MR_OPERATOR_TYPE_NORMALIZE_PICO`) to apply L1/L2/INF/MINMAX normalization.
-- `inputs[0]` is the tensor to normalize and `outputs[0]` the normalized result; shapes must match (`securemr_operators.md` §10).
-- Set `normalize_type` (or `attrs[0]`) to one of `"l1"`, `"l2"`, `"inf"`, `"minmax"`; map to `XrSecureMrNormalizeTypePICO`.
-- Alpha/Beta tuning mentioned in the operator guide is not exposed by the current pipeline helper; loader support is pending.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO`
+- Positional signature: 1 to 10 input slots and 1 result. Only inputs referenced by the expression need to be connected; inputs are MAT tensors.
+- `attrs[0]` contains the expression. Supported syntax includes tensor references `{0}`, `{1}`, and so on, constants, parentheses, `+`, `-`, `*`, `/`, `^`, transpose, inverse, and trigonometric/hyperbolic functions (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`).
+- The result is a MAT whose shape, OpenCV depth, and channel count match the evaluated expression.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO` (`arithmetic`)
-- Implements the arithmetic-compose operator via `Pipeline::arithmetic` (`serialization.cpp:771-780`).
-- All inputs are operands referenced in the expression; the first output receives the evaluation result.
-- Use `expression` (or `attrs[0]`) to encode the formula with `{index}` placeholders and `+ - * /`, per `securemr_operators.md` §1.
-- Ensure the result tensor usage matches MAT; operands must be MAT or arrays of MAT tensors.
+#### `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MIN_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MAX_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MULTIPLY_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_OR_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_AND_PICO`
+- Each operator has exactly 2 inputs and 1 result.
+- Both inputs and the result must have identical ranks, dimensions, and channel counts.
+- `or` and `and` require integer inputs and an integer result. `min`, `max`, and `multiply` accept numeric tensors.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MIN_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MAX_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MULTIPLY_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_OR_PICO` / `XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_AND_PICO` (`elementwise_min`, `elementwise_max`, `elementwise_multiply`, `elementwise_or`, `elementwise_and`)
-- Share the same wiring through elementwise helpers (`serialization.cpp:781-801`).
-- Require two operands and at least one output; operands must have identical shape and channel layout.
-- Select the operation by choosing one of the `type` strings listed above.
-- Use integer tensors for logical ops (`or`, `and`) and numeric tensors for `min`, `max`, `multiply`.
+#### `XR_SECURE_MR_OPERATOR_TYPE_NMS_PICO`
+- Positional signature: 2 inputs (`scores`, `boxes`) and 3 optional result slots (`scores`, `boxes`, `indices`).
+- `scores` is a floating-point MAT shaped `N×1` or `1×N`. `boxes` is floating-point and may be a 1-channel `N×4` MAT or a 4-channel `N×1` MAT.
+- Result 0 is floating-point scores, result 1 is floating-point boxes, and result 2 is integer indices. Provided result sizes must agree.
+- `attrs` may be omitted or contain one numeric IoU threshold; the default is `0.95`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_NMS_PICO` (`nms`)
-- Uses `Pipeline::nms` (`XR_SECURE_MR_OPERATOR_TYPE_NMS_PICO`) to filter bounding boxes (`serialization.cpp:803-827`).
-- `inputs[0]` is scores and `inputs[1]` is boxes; up to three outputs deliver filtered scores, boxes, and indices.
-- Provide `threshold` or `attrs[0]` as the IoU cut-off; loader parses numeric strings automatically (`securemr/serialization.py:347-352`).
-- Result tensors are optional—supply only the ones you need, leaving others absent or null.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SOLVE_P_N_P_PICO`
+- Positional signature: exactly 3 inputs (`object points`, `image points`, `camera matrix`) and 2 results (`rotation`, `translation`); optional result slots are not defined.
+- Object points are floating-point 3-channel point data, image points are floating-point 2-channel point data, and the camera matrix is a 1-channel floating-point 3×3 MAT.
+- Both results are 1-channel FLOAT64 MATs with three total elements.
+- Any JSON point-array conversion is loader behavior and must produce these tensor forms before connection.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SOLVE_P_N_P_PICO` (`solve_p_n_p`)
-- Wraps the SolvePnP helper (`serialization.cpp:829-893`) to estimate pose from 2D/3D correspondences.
-- Expect three inputs (object points, image points, camera matrix) plus optional outputs for rotation and translation.
-- Loader auto-converts tensor data into Point2/Point3 buffers when necessary, storing temporaries in `outResult.auxiliaryTensors`.
-- Follows OpenCV semantics; ensure tensors originate from `camera_access` to reuse the correct camera intrinsics.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SORT_VEC_PICO`
+- Positional signature: 1 input (`input`) and 2 optional results (`sorted`, `indices`).
+- The input and `sorted` result are one-channel VEC tensors with one-dimensional shape. `indices`, when present, is also one-channel, one-dimensional, and integer.
+- Any provided result must have the same shape as the input.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SORT_VEC_PICO` (`sort_vec`)
-- Exposes `Pipeline::sortVec` (`XR_SECURE_MR_OPERATOR_TYPE_SORT_VEC_PICO`) to sort 1-D vectors.
-- `inputs[0]` is the vector to sort; `outputs[0]` (optional) stores the sorted values, `outputs[1]` (optional) stores the original indices.
-- Operates on single-channel tensors; indices output must use an integer data type.
-- Add a custom deserializer branch—`serialization.cpp` currently lacks explicit support.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SORT_MAT_PICO`
+- Positional signature: 1 input (`input`) and 2 optional results (`sorted`, `indices`).
+- Input and results are 2D, one-channel MAT tensors. `indices` must be integer and all provided result shapes must match the input shape.
+- `attrs` may be omitted or contain one value: uppercase `ROW` (default) or `COLUMN`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SORT_MAT_PICO` (`sort_mat`)
-- Uses `Pipeline::sortMatByRow` / `sortMatByColumn` via `XR_SECURE_MR_OPERATOR_TYPE_SORT_MAT_PICO` (`serialization.cpp:894-914`).
-- A single matrix input plus optional outputs for sorted values and indices; tensors must be 2-D single-channel mats.
-- Configure the orientation with `mode` (`"row"` default) or `attrs[0]` (`"col"`/`"column"` switches to column sort).
-- Result tensors, when present, must match the input shape; indices output uses integer types.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SVD_PICO`
+- Positional signature: 1 input (`src`) and 3 result slots (`w`, `u`, `vt`). Each result slot may be null; provided results must be 1-channel floating-point 2D MAT tensors with the corresponding SVD shape.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SVD_PICO` (`svd`)
-- Wraps `Pipeline::singularValueDecomposition` for `XR_SECURE_MR_OPERATOR_TYPE_SVD_PICO`.
-- Requires one matrix input; outputs for singular values (`w`), left singular vectors (`u`), and right singular vectors (`vt`) are optional.
-- Shapes follow OpenCV’s SVD conventions; omit outputs you do not need to save memory.
-- Serialization support is not yet implemented; wire it via a custom handler if you need JSON specs today.
+#### `XR_SECURE_MR_OPERATOR_TYPE_NORM_PICO`
+- Positional signature: 1 input (`operand0`) and 1 result (`result0`).
+- The input is a MAT tensor. The result must be a one-channel FLOAT32/FLOAT64 scalar tensor: a one-dimensional shape `{1}` or a shape whose every dimension is 1. It is not a per-channel reduction.
+- `attrs` may be omitted or contain one value: `L1`, `L2` (default), or `INF`; more than one attribute is rejected.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_NORM_PICO` (`norm`)
-- Implements `Pipeline::norm` (`XR_SECURE_MR_OPERATOR_TYPE_NORM_PICO`) to compute the vector norm of a tensor.
-- Single input tensor; single output scalar (or per-channel scalar) containing the norm result.
-- Use when you need L2-style reductions without normalizing the tensor itself.
-- Not processed by the default loader; requires a custom branch to deserialize.
+#### `XR_SECURE_MR_OPERATOR_TYPE_CHW_HWC_PICO`
+- Positional signature: 1 input and 1 result.
+- One side must be an HWC 2D MAT with shape `[H,W]` and `C` channels. The other side must be a CHW 3D MAT tensor array with shape `[C,H,W]` and one channel.
+- The input and result data types must match. The operator supports both HWC→CHW and CHW→HWC.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SWAP_HWC_CHW_PICO` (`swap_hwc_chw`)
-- Calls `Pipeline::convertHWC_CHW` (`XR_SECURE_MR_OPERATOR_TYPE_SWAP_HWC_CHW_PICO`) to reorder tensor layout.
-- Inputs and outputs must use SecureMR channelized 3D matrix encoding. For an HWC tensor with `dimensions: [H, W]` and `channels: C`, the CHW tensor must be declared as `dimensions: [C, H]` and `channels: W`; the reverse direction uses the inverse mapping.
-- Native binding uses the default unary operator names (`operand` / `result`), not `src` / `dst`.
-- Handy before invoking neural-network runtimes expecting channel-first tensors.
+#### `XR_SECURE_MR_OPERATOR_TYPE_INVERSION_PICO`
+- Positional signature: 1 input (`operand`) and 1 result (`result`). Both are MAT tensors with 2D shapes.
+- The result shape must equal the matrix inverse shape; the input must therefore be square for a normal inverse operation.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_INVERSION_PICO` (`inversion`)
-- Uses `Pipeline::inversion` (`XR_SECURE_MR_OPERATOR_TYPE_INVERSION_PICO`) to compute matrix inverses.
-- One matrix input; one matrix output storing the inverted result.
-- Ensure the operand is square and invertible; data type should be float per SecureMR guidance.
-- Needs explicit handling in the deserializer because the default code path does not know this type yet.
+#### `XR_SECURE_MR_OPERATOR_TYPE_MAKE_TRANSFORM_MAT_PICO`
+- Positional signature: 3 inputs (`rotation`, `translation`, optional `scale`) and 1 result (`result`).
+- Rotation, translation, and provided scale are one-channel floating-point MAT tensors containing three values. The scale slot is nullable and defaults to identity.
+- The result is a one-channel floating-point 4×4 MAT. Translation may be shaped 3×1 or 1×3.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_GET_TRANSFORM_MAT_PICO` (`get_transform_mat`; alias `MAKE_TRANSFORM_MAT`)
-- Backs `Pipeline::transform` for building 4×4 transforms.
-- Provide rotation and translation tensors; `inputs[2]` may optionally carry scale (omit to assume identity).
-- `outputs[0]` becomes a 4×4 float MAT combining the supplied components.
+#### `XR_SECURE_MR_OPERATOR_TYPE_UPLOAD_TEXTURE_TO_GLTF_PICO`
+- Positional signature: 2 inputs (`gltf`, `rgb image`) and 1 result (`texture ID`).
+- The GLTF input must be a GLTF tensor. The image is a UINT8, 3- or 4-channel MAT, either a 2D image or an array of such images.
+- The result is a 1-channel UINT16 VEC containing one texture ID per uploaded image.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_LOAD_TEXTURE_PICO` (`load_texture`)
-- Wraps `Pipeline::newTextureToGLTF` (`XR_SECURE_MR_OPERATOR_TYPE_LOAD_TEXTURE_PICO`) to inject textures into GLTF assets.
-- `inputs[0]` is the GLTF placeholder tensor; `inputs[1]` is the RGB texture data.
-- `outputs[0]` returns the generated texture identifier tensor for subsequent render commands.
-- Not deserialized automatically yet; rely on a custom handler when recording GLTF texture uploads.
-
-#### `XR_SECURE_MR_OPERATOR_TYPE_SWITCH_GLTF_RENDER_STATUS_PICO` (`switch_gltf_render_status`)
-- Toggles rendering for a GLTF placeholder.
-- `inputs[0]` is the GLTF placeholder tensor; `inputs[1]` may optionally provide the pose/transform.
-- This is available in the Python creation and verification helpers for package specs that include GLTF assets.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SWITCH_GLTF_RENDER_STATUS_PICO`
+- Positional signature: exactly 4 inputs and 0 results: `gltf`, `world pose`, `visible`, and `view locked`.
+- `gltf` is required and must be a GLTF tensor. `world pose` is nullable; when provided it must be a 1-channel FLOAT32/FLOAT64 4×4 MAT.
+- `visible` is nullable and has no type restriction. Null means visible; a false/zero-valued tensor ends rendering, while a truthy tensor permits rendering to begin when the pose is valid.
+- `view locked` is nullable and truthiness controls the renderer's `viewLocked` argument. It does not provide a pose.
+- The operator begins rendering only when the pose is valid and `visible` is null or truthy; otherwise it ends rendering.
 - XR mode only.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_GLTF_PICO` (`update_gltf`)
-- Applies a GLTF update command to the referenced placeholder.
-- `inputs[0]` is the GLTF placeholder tensor.
-- Provide the update command via `update_type` or `attrs[0]`.
+#### `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_GLTF_PICO`
+- Positional signature: 3 input slots and 0 results. Input 0 is always `gltf`; the other slots depend on the required `attrs[0]` value.
+- Supported `attrs[0]` values are `local`, `animation`, `world pose`, `texture`, `material::metallic_factor`, `material::roughness_factor`, `material::metallic_roughness_texture`, `material::base_color_factor`, `material::base_color_texture`, `material::normal_map_texture`, `material::occlusion_texture`, `material::emissive_factor`, `material::emissive_strength`, and `material::emissive_texture`.
+- Operand names depend on `attrs[0]`: `node ID`/`transform`, `animation ID`/`animation timer`, `world pose`, `material ID`/`value`, or `texture ID`/`rgb image`. Unused slots remain null.
 - XR mode only.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO` (`render_text`)
-- Renders text into a texture-like tensor that can be used by GLTF/rendering operators.
-- `inputs[0]` is the target placeholder or texture tensor.
-- `config`/`attrs[0]` uses `typeface#language#width#height`; `text`/`attrs[1]` provides the rendered text.
+#### `XR_SECURE_MR_OPERATOR_TYPE_RENDER_TEXT_PICO`
+- Positional signature: 6 inputs and 0 results: `text`, `start`, `colors`, `gltf`, `texture ID`, and `font size`.
+- `text` is a required text-compatible tensor. `start` is a one-element FLOAT32/FLOAT64 Point2. `colors` is a two-element, 4-channel UINT8 VEC containing text RGBA and background RGBA.
+- `gltf` is the target GLTF tensor. `texture ID` is a one-element UINT16 VEC identifying an existing RGBA texture. `font size` is a one-element FLOAT32/FLOAT64 VEC.
+- `attrs[0]` must use the form `typeface#language#width#height`. Text is an input tensor, not `attrs[1]`, and this operator has no output tensor.
 - XR mode only.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO` (`scenegraph_visibility`)
-- Toggles Spatial scenegraph visibility.
-- `inputs[0]` is the scenegraph/component placeholder.
-- Use `visible` or `attrs[0]` as a boolean-like value.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO`
+- The package also accepts `XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO` as an alias for this operator.
+- Positional signature: 2 inputs (`scenegraph`, `visible`) and 0 results.
+- `scenegraph` is required and must be a GLTF tensor. `visible` is a nullable boolean-like tensor; null means visible and a truthy value means visible.
+- `visible` is a tensor input, not an operator attribute or constructor setting.
 - Spatial mode only.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO` (`update_component`)
-- Updates a property of a specific entity in a Spatial scene graph.
-- `scenegraph` or `inputs[0]` identifies the scene-graph tensor.
-- `entity_path` identifies the target entity and must start with `/`; `/` refers to the scene root.
-- `property` (or `target_property`) identifies the `SceneGraphProperty`, for example `Transform.Scale`, `Text.Content`, or `PBRMaterials[0].BaseColor`.
-- `data` or `inputs[1]` identifies the tensor supplying the new property value.
-- This operator has no outputs.
-- The legacy `enabled` / `update_type` form is not a valid component update because it does not identify an entity, property, or data tensor.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO`
+- The package also accepts `XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO` as an alias for this operator.
+- Positional signature: 2 inputs (`scenegraph`, `data`) and 0 results. `attrs[0]` contains the component path used to identify the target component.
+- `scenegraph` is required and must be a GLTF tensor. `data` is validated by the target component callback and can represent supported strings, scalar factors, 3D/4D vectors, points, colors, 3×3/4×4 matrices, or UINT8 enum values.
+- `attrs[0]` has the component-path form `/entity/path:component.field`; it must start with `/` and contain `:`. The entity path is split on `/` before the colon, and the component identifier uses the text after the colon.
 - Spatial mode only.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO` (`microphone`)
-- Captures microphone data into the output tensor.
-- No required inputs; `outputs[0]` receives the audio buffer.
-- Available in both XR and Spatial modes.
+#### `XR_SECURE_MR_OPERATOR_TYPE_MICROPHONE_PICO`
+- Positional signature: 0 inputs and 1 or 2 results: required `stereo audio`, followed by optional `timestamp`.
+- `timestamp` is a 4-channel INT32 VEC with shape `{1}`.
+- The audio result data type must match the encoding selected by `attrs[0]`: `PCM_16BIT` accepts UINT16 or INT16, `PCM_32BIT` accepts INT32, and `PCM_FLOAT` accepts FLOAT32. Stereo may be represented by two channels or a one-channel tensor whose final dimension is 2; left/right results are one-channel.
+- Exactly one attribute is required. `attrs[0]` must use the form `<SAMPLE_RATE>;<PCM_16BIT|PCM_32BIT|PCM_FLOAT>`, where `SAMPLE_RATE` is a positive value within the supported audio sample-rate range. `PCM_8BIT` is not supported.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_SPEAKER_PICO` (`speaker`)
-- Sends audio data to the speaker path.
-- `inputs[0]` is the audio tensor.
-- Available in both XR and Spatial modes.
+#### `XR_SECURE_MR_OPERATOR_TYPE_SPEAKER_PICO`
+- Positional signature: 1 input (`audio`) and 0 results.
+- The input must contain one or two channels and use UINT16/INT16, INT32, or FLOAT32 data for PCM16, PCM32, or PCM float playback. A one-channel tensor with a trailing dimension of 2 is treated as interleaved stereo.
+- `attrs[0]` must contain the positive sample rate, within the supported audio sample-rate range.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_DEPTH_PICO` (`depth`)
-- Captures or exposes depth data into the output tensor.
-- No required inputs; `outputs[0]` receives the depth buffer.
-- Available in both XR and Spatial modes.
+#### `XR_SECURE_MR_OPERATOR_TYPE_DEPTH_PICO`
+- Positional signature: 0 inputs and 1 result named `depth map`.
+- The result must be a 1-channel FLOAT32/FLOAT64 2D MAT. If its dimensions differ from the camera depth map, the depth map is resized into the result.
+- Construction fails on an emulator because depth camera data is unavailable.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO` (`javascript`; alias `JS_SCRIPTING`)
-- Executes a JavaScript snippet to populate output tensors from named inputs.
-- Use `script` or `attrs[0]` for the JavaScript source.
-- `inputs` and `outputs` may use object references with `name` and `tensor` to preserve script-visible aliases.
+#### `XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO`
+- The package also accepts `XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO` as an alias for this operator.
+- `attrs[0]` contains the JavaScript source.
+- Input and result slots are independent named bindings. Every input binding is made available to the script and every result binding is written by the script; their counts and names do not need to match. Zero inputs are allowed, but at least one connected result is required.
+- Each input/output object uses `tensor` for the package tensor and may use `name` for the JavaScript variable name. The loader must place the source in `attrs[0]`.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_UNKNOWN_PICO` (`unknown`)
-- Reserved for explicitly unknown or pass-through operators in tests and custom pipelines.
-- Package deserializers should treat this like a custom operator unless they intentionally implement a fallback.
+#### `XR_SECURE_MR_OPERATOR_TYPE_UNKNOWN_PICO`
+- Reserved for unknown or pass-through operator records. No executable implementation is defined for this enum; package loaders and tests must not assume it executes.
 
-#### `XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO` (`run_algorithm`)
-- Designed for model execution pipelines (`serialization.cpp:915-996`).
-- `inputs` and `outputs` are arrays of `{ "name": alias, "tensor": tensor_name }`; strings default aliases to tensor names.
-- For new SpatialML Pipeline Zoo packages, put model metadata inline under `model` with `bin_path`, `model_name`, `model_type: "tflite"`, `model_target` (for example `npu`), and optional `cpu_target_num_threads`.
-- Schema version 2 does not use manifest-level model ids, `model_id`, external model metadata JSON files, `model_asset`, or filesystem `model_file` fields for package-authored TFLite operators.
-- Python utilities (`add_model_inference_operator`, `convert_python_custom_to_run_algorithm`) populate tensors and metadata automatically (`securemr/serialization.py:621-712`).
-
-#### Custom operators
-- Unrecognized `type` values fall back to `PipelineDeserializationOptions::customOperatorHandler` (`serialization.cpp:918-920`). Provide `attrs` or additional keys your handler understands.
-- `name_to_type` in Python tolerates numeric enum values and aliases, supporting custom handlers (`securemr/serialization.py:103-206`).
+#### `XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO`
+- Positional signature is model-defined: the number of inputs and results comes from the LiteRT model's input/output count. Input and output names come from the model metadata.
+- The package loader must provide the model metadata and runtime selection needed to initialize the LiteRT/TFLite model. The supported runtime type is `tflite`; supported backends are `cpu`, `gpu`, and `npu`.
+- Tensor compatibility is checked against the actual model buffers, including element type and dimensions; it is not determined only by the JSON tensor descriptor.
+- Inline schema-v2 `model` metadata, `bin_path`, and `model_target` are package fields. Each model input/output reference uses the common `{name, tensor}` object form when the model name differs from the package tensor name.
 
 ## Inputs and Outputs Arrays
 
@@ -365,4 +370,4 @@ Below lists the supported operators observed in the serializers together with th
 
 1. The extended Python `Pipeline` records every allocation and connection into `self.spec` while user code builds the graph (`securemr/serialization.py:264-390`).
 2. Calling `Pipeline.save` writes the spec with UTF-8 encoding and pretty formatting (`securemr/serialization.py:536-540`).
-3. The C++ loader validates `tensors` and `operators`, constructs a `Pipeline`, and wires operators using the described keys. Any mismatch produces descriptive errors (`serialization.cpp:461-917`).
+3. The package loader validates `tensors` and `operators`, validates `attrs` and nullable positional references, and wires the pipeline. Any mismatch should produce a descriptive error.

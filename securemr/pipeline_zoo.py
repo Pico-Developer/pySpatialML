@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -62,8 +63,11 @@ class PipelineZooPackageSpec:
         runtime = dict(self.runtime)
         if self.supported_modes:
             runtime["supported_modes"] = _normalize_supported_modes(self.supported_modes)
-        if runtime:
-            manifest["runtime"] = runtime
+        elif "supported_modes" in runtime:
+            runtime["supported_modes"] = _normalize_supported_modes(runtime["supported_modes"])
+        else:
+            runtime["supported_modes"] = ["xr", "spatial"]
+        manifest["runtime"] = runtime
         if self.metadata:
             manifest["metadata"] = dict(self.metadata)
         return manifest
@@ -74,8 +78,8 @@ def create_litert_model_spec(
     model_name: str,
     *,
     model_target: str = "npu",
-    input_tensors: Optional[Sequence[Mapping[str, Any]]] = None,
-    output_tensors: Optional[Sequence[Mapping[str, Any]]] = None,
+    input_tensors: Sequence[Mapping[str, Any]],
+    output_tensors: Sequence[Mapping[str, Any]],
     cpu_target_num_threads: int = 1,
 ) -> JsonDict:
     """Create an inline LiteRT/TFLite model spec for a model inference operator.
@@ -84,24 +88,33 @@ def create_litert_model_spec(
         model_path: Package-relative path to the ``.tflite`` model file.
         model_name: Logical model name referenced by pipeline inference operators.
         model_target: Runtime target requested by the package (``npu`` by default).
-        input_tensors: Optional model input tensor metadata.
-        output_tensors: Optional model output tensor metadata.
+        input_tensors: Required model input tensor metadata. Each entry must
+            contain ``name``, ``shape``, and ``encoding_type``.
+        output_tensors: Required model output tensor metadata. Each entry must
+            contain ``name``, ``shape``, and ``encoding_type``.
         cpu_target_num_threads: Number of CPU threads when ``model_target`` selects CPU.
 
     Returns:
         A dictionary ready to place under a ``run_algorithm`` operator's ``model`` key.
     """
+    _validate_model_io_metadata(input_tensors, field="input")
+    _validate_model_io_metadata(output_tensors, field="output")
+    _validate_model_name(model_name)
+    if not isinstance(model_target, str):
+        raise ValueError("model_target must be a string")
+    normalized_target = model_target.lower()
+    if normalized_target not in {"cpu", "gpu", "npu"}:
+        raise ValueError("model_target must be cpu, gpu, or npu")
     model_spec: JsonDict = {
         "bin_path": _normalize_package_path(model_path),
         "model_name": model_name,
         "model_type": "tflite",
-        "model_target": model_target,
-        "cpu_target_num_threads": int(cpu_target_num_threads),
+        "model_target": normalized_target,
+        "input": [dict(tensor) for tensor in input_tensors],
+        "output": [dict(tensor) for tensor in output_tensors],
     }
-    if input_tensors is not None:
-        model_spec["input"] = [dict(tensor) for tensor in input_tensors]
-    if output_tensors is not None:
-        model_spec["output"] = [dict(tensor) for tensor in output_tensors]
+    if normalized_target == "cpu":
+        model_spec["cpu_target_num_threads"] = int(cpu_target_num_threads)
     return model_spec
 
 
@@ -122,12 +135,14 @@ def configure_litert_inference_operator(
         raise ValueError("Specify either model or model_path for an inference operator, not both")
     if model is not None:
         result["model"] = dict(model)
-        if not result["model"].get("bin_path"):
-            raise ValueError("Inline model metadata requires bin_path")
-        result["model"]["bin_path"] = _normalize_package_path(str(result["model"]["bin_path"]))
-        result["model"].setdefault("model_type", "tflite")
-        result["model"].setdefault("model_target", model_target)
-        result["model"].setdefault("cpu_target_num_threads", int(cpu_target_num_threads))
+        _validate_inline_model_metadata(result["model"])
+        result["model"]["bin_path"] = _normalize_package_path(result["model"]["bin_path"])
+        result["model"]["model_type"] = result["model"]["model_type"].lower()
+        result["model"]["model_target"] = result["model"]["model_target"].lower()
+        if result["model"]["model_target"] == "cpu":
+            result["model"].setdefault("cpu_target_num_threads", int(cpu_target_num_threads))
+        else:
+            result["model"].pop("cpu_target_num_threads", None)
     elif model_path is not None:
         result["model"] = create_litert_model_spec(
             model_path,
@@ -141,22 +156,58 @@ def configure_litert_inference_operator(
         raise ValueError("A run_algorithm operator requires inline model metadata")
     if model_name is not None:
         result["model"].setdefault("model_name", model_name)
-    # Keep the nested v2 model object authoritative while mirroring the
-    # operator-level fields still consumed by the active native loader. This
-    # prevents an inline model's backend/thread settings from disagreeing
-    # with the compatibility fields at the same operator level.
-    model_metadata = result["model"]
-    model_metadata.setdefault("model_type", "tflite")
-    model_metadata.setdefault("model_target", model_target)
-    model_metadata.setdefault("cpu_target_num_threads", int(cpu_target_num_threads))
-    for key in ("model_name", "model_type", "model_target", "cpu_target_num_threads"):
-        if key in model_metadata:
-            result[key] = model_metadata[key]
     result.pop("model_asset", None)
     result.pop("model_file", None)
     result.pop("model_id", None)
     result.pop("bin_path", None)
     return result
+
+
+def _validate_model_io_metadata(
+    entries: Optional[Sequence[Mapping[str, Any]]], *, field: str
+) -> None:
+    if entries is None:
+        raise ValueError(f"Model metadata requires {field} tensor metadata")
+    if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
+        raise ValueError(f"Model metadata {field} must be an array")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"Model metadata {field}[{index}] must be an object")
+        missing = [key for key in ("name", "shape", "encoding_type") if key not in entry]
+        if missing:
+            raise ValueError(
+                f"Model metadata {field}[{index}] missing required keys: {', '.join(missing)}"
+            )
+        if not isinstance(entry["name"], str) or not entry["name"]:
+            raise ValueError(f"Model metadata {field}[{index}].name must be a non-empty string")
+        shape = entry["shape"]
+        if (not isinstance(shape, list) or not shape or
+                any(not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0
+                    for dimension in shape)):
+            raise ValueError(f"Model metadata {field}[{index}].shape must be an array of positive integers")
+        if not isinstance(entry["encoding_type"], str) or not entry["encoding_type"]:
+            raise ValueError(f"Model metadata {field}[{index}].encoding_type must be a non-empty string")
+
+
+def _validate_inline_model_metadata(model: Mapping[str, Any]) -> None:
+    required = ("bin_path", "model_type", "model_target", "input", "output")
+    missing = [key for key in required if key not in model]
+    if missing:
+        raise ValueError(f"Inline model metadata missing required keys: {', '.join(missing)}")
+    if not isinstance(model["bin_path"], str) or not model["bin_path"]:
+        raise ValueError("Inline model metadata bin_path must be a non-empty string")
+    if not isinstance(model["model_type"], str) or model["model_type"].lower() != "tflite":
+        raise ValueError("Inline model metadata model_type must be 'tflite'")
+    if not isinstance(model["model_target"], str) or model["model_target"].lower() not in {"cpu", "gpu", "npu"}:
+        raise ValueError("Inline model metadata model_target must be cpu, gpu, or npu")
+    _validate_model_name(model.get("model_name", "main"))
+    _validate_model_io_metadata(model["input"], field="input")
+    _validate_model_io_metadata(model["output"], field="output")
+
+
+def _validate_model_name(model_name: Any) -> None:
+    if not isinstance(model_name, str) or re.fullmatch(r"[A-Za-z0-9_]+", model_name) is None:
+        raise ValueError("model_name must contain only letters, digits, and underscores")
 
 
 def write_pipeline_zoo_package(
@@ -208,31 +259,39 @@ def load_pipeline_zoo_manifest(path: PathLike) -> JsonDict:
 
 def validate_pipeline_zoo_manifest(manifest: Mapping[str, Any]) -> None:
     """Validate the manifest fields required by the SpatialML package schema."""
+    if not isinstance(manifest, Mapping):
+        raise ValueError("SpatialML manifest must be an object")
     required = ["id", "pipelines"]
     missing = [key for key in required if key not in manifest]
     if missing:
         raise ValueError(f"SpatialML manifest missing required fields: {', '.join(missing)}")
-    if str(manifest.get("schema_version", "")) != "2":
+    if manifest.get("schema_version") != "2":
         raise ValueError("SpatialML manifest schema_version must be 2")
+    if not isinstance(manifest["id"], str) or not manifest["id"]:
+        raise ValueError("SpatialML manifest id must be a non-empty string")
     if "model" in manifest or "models" in manifest:
         raise ValueError("SpatialML manifest must not contain model/models; v2 stores model metadata inline")
     if not isinstance(manifest["pipelines"], list) or not manifest["pipelines"]:
         raise ValueError("SpatialML manifest requires a non-empty 'pipelines' list")
     pipeline_ids = []
     for index, pipeline in enumerate(manifest["pipelines"]):
-        if not isinstance(pipeline, Mapping) or not pipeline.get("id") or not pipeline.get("path"):
+        if not isinstance(pipeline, Mapping):
             raise ValueError(f"SpatialML manifest pipeline #{index} requires 'id' and 'path'")
+        if not isinstance(pipeline.get("id"), str) or not pipeline["id"]:
+            raise ValueError(f"SpatialML manifest pipeline #{index}.id must be a non-empty string")
+        if not isinstance(pipeline.get("path"), str) or not pipeline["path"]:
+            raise ValueError(f"SpatialML manifest pipeline #{index}.path must be a non-empty string")
         pipeline_id = pipeline["id"]
         if any(pipeline_id == existing_id for existing_id in pipeline_ids):
             raise ValueError(f"Duplicate pipeline id: {pipeline_id}")
         pipeline_ids.append(pipeline_id)
-        _normalize_package_path(str(pipeline["path"]))
-    runtime = manifest.get("runtime", {})
-    if runtime and not isinstance(runtime, Mapping):
-        raise ValueError("SpatialML manifest 'runtime' must be an object when present")
-    supported_modes = runtime.get("supported_modes", []) if runtime else []
-    if supported_modes:
-        _normalize_supported_modes(supported_modes)
+        _normalize_package_path(pipeline["path"])
+    runtime = manifest.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise ValueError("SpatialML manifest requires runtime.supported_modes")
+    if "supported_modes" not in runtime:
+        raise ValueError("SpatialML manifest requires runtime.supported_modes")
+    _normalize_supported_modes(runtime["supported_modes"])
 
 
 def _write_json(path: Path, payload: Mapping[str, Any], *, indent: int) -> None:

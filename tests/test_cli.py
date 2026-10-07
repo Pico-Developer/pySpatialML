@@ -591,11 +591,13 @@ def test_operator_list_command(capsys):
 
 
 def test_operator_describe_command(capsys):
-    assert cli_module.main(["operator", "describe-op", "arithmetic"]) == 0
+    assert cli_module.main(["operator", "describe-op", "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO"]) == 0
 
     captured = capsys.readouterr()
     assert "Operator: ARITHMETIC_COMPOSE" in captured.out
     assert "Creator: arithmetic" in captured.out
+    assert "Input switches: --operand0" in captured.out
+    assert "Output switches: --result" in captured.out
 
 
 def test_operator_describe_command_reports_unknown(capsys):
@@ -709,10 +711,10 @@ def test_pipeline_builder_commands_create_validate_and_inspect_pipeline(capsys, 
             "pipeline",
             "add-op",
             str(pipeline),
-            "assignment",
-            "--input",
+            "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
+            "--src",
             "image",
-            "--output",
+            "--dst",
             "image_f32",
         ]
     ) == 0
@@ -721,10 +723,10 @@ def test_pipeline_builder_commands_create_validate_and_inspect_pipeline(capsys, 
             "pipeline",
             "add-op",
             str(pipeline),
-            "arithmetic",
-            "--input",
+            "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
+            "--operand0",
             "image_f32",
-            "--output",
+            "--result",
             "normalized",
             "--expression",
             "{0} / 255.0",
@@ -740,7 +742,7 @@ def test_pipeline_builder_commands_create_validate_and_inspect_pipeline(capsys, 
     assert spec["inputs"] == ["image"]
     assert spec["outputs"] == ["normalized"]
     assert len(spec["operators"]) == 2
-    assert spec["operators"][1]["expression"] == "{0} / 255.0"
+    assert spec["operators"][1]["attrs"] == ["{0} / 255.0"]
     assert "Pipeline is valid" in captured.out
     assert "Operators: 2" in captured.out
 
@@ -756,7 +758,7 @@ def test_pipeline_add_op_arithmetic_requires_expression(capsys, tmp_path):
         ["pipeline", "add-tensor", str(pipeline), "y", "--shape", "2,2", "--dtype", "float32", "--output"]
     ) == 0
 
-    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "arithmetic", "--input", "x", "--output", "y"])
+    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO", "--operand0", "x", "--result", "y"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -764,7 +766,7 @@ def test_pipeline_add_op_arithmetic_requires_expression(capsys, tmp_path):
     assert "Arithmetic operators require --expression" in captured.err
 
 
-def test_pipeline_add_op_javascript_requires_code(capsys, tmp_path):
+def test_pipeline_add_op_js_scripting_requires_code(capsys, tmp_path):
     pipeline = tmp_path / "pipeline.json"
 
     assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
@@ -775,15 +777,15 @@ def test_pipeline_add_op_javascript_requires_code(capsys, tmp_path):
         ["pipeline", "add-tensor", str(pipeline), "y", "--shape", "2,2", "--dtype", "float32", "--output"]
     ) == 0
 
-    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "javascript", "--input", "x", "--output", "y"])
+    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO", "--x", "x", "--named-output", "y=y"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "PSM_PIPELINE" in captured.err
-    assert "javascript operators require --attr with JavaScript code" in captured.err
+    assert "JS_SCRIPTING operators require script or attrs[0]" in captured.err
 
 
-def test_pipeline_add_op_convert_color_requires_input(capsys, tmp_path):
+def test_pipeline_add_op_cvt_color_requires_input(capsys, tmp_path):
     pipeline = tmp_path / "pipeline.json"
 
     assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
@@ -791,12 +793,94 @@ def test_pipeline_add_op_convert_color_requires_input(capsys, tmp_path):
         ["pipeline", "add-tensor", str(pipeline), "y", "--shape", "2,2,3", "--dtype", "uint8", "--output"]
     ) == 0
 
-    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "convert_color", "--output", "y", "--flag", "4"])
+    exit_code = cli_module.main(["pipeline", "add-op", str(pipeline), "XR_SECURE_MR_OPERATOR_TYPE_CONVERT_COLOR_PICO", "--dst", "y", "--flag", "4"])
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "PSM_PIPELINE" in captured.err
     assert "convert_color operators require exactly 1 input" in captured.err
+
+
+def test_pipeline_add_op_named_inputs_are_written_in_operator_order(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
+    for name in ("left", "right", "result"):
+        assert cli_module.main(
+            [
+                "pipeline", "add-tensor", str(pipeline), name,
+                "--shape", "2,2", "--dtype", "float32",
+            ]
+        ) == 0
+
+    assert cli_module.main(
+        [
+            "pipeline", "add-op", str(pipeline),
+            "XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MIN_PICO",
+            "--operand1", "right",
+            "--result", "result",
+            "--operand0", "left",
+        ]
+    ) == 0
+
+    inputs = json.loads(pipeline.read_text(encoding="utf-8"))["operators"][0]["inputs"]
+    assert inputs == [{"tensor": "left"}, {"tensor": "right"}]
+
+
+def test_pipeline_add_op_named_outputs_are_written_in_operator_order(tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
+    tensors = (
+        ("objects", "4", "point", "3"),
+        ("points", "4", "point", "2"),
+        ("camera", "3,3", "matrix", None),
+        ("rvec", "3,1", "matrix", None),
+        ("tvec", "3,1", "matrix", None),
+    )
+    for name, shape, usage, channels in tensors:
+        command = [
+            "pipeline", "add-tensor", str(pipeline), name,
+            "--shape", shape, "--dtype", "float64", "--usage", usage,
+        ]
+        if channels is not None:
+            command.extend(["--channels", channels])
+        assert cli_module.main(
+            command
+        ) == 0
+
+    assert cli_module.main(
+        [
+            "pipeline", "add-op", str(pipeline),
+            "XR_SECURE_MR_OPERATOR_TYPE_SOLVE_P_N_P_PICO",
+            "--translation", "tvec",
+            "--camera-matrix", "camera",
+            "--rotation", "rvec",
+            "--image-points", "points",
+            "--object-points", "objects",
+        ]
+    ) == 0
+
+    outputs = json.loads(pipeline.read_text(encoding="utf-8"))["operators"][0]["outputs"]
+    assert outputs == [
+        {"tensor": "rvec"}, {"tensor": "tvec"}
+    ]
+
+
+def test_pipeline_add_op_rejects_generic_input_for_fixed_operator(capsys, tmp_path):
+    pipeline = tmp_path / "pipeline.json"
+    assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
+
+    exit_code = cli_module.main(
+        [
+            "pipeline", "add-op", str(pipeline),
+            "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
+            "--input", "x", "--dst", "y",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "--input is not an input or result for ASSIGNMENT" in captured.err
+    assert "expected --src, --dst" in captured.err
 
 
 def test_pipeline_commands_json_output(capsys, tmp_path):
@@ -864,10 +948,10 @@ def test_pipeline_commands_json_output(capsys, tmp_path):
             "pipeline",
             "add-op",
             str(pipeline),
-            "assignment",
-            "--input",
+            "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
+            "--src",
             "x",
-            "--output",
+            "--dst",
             "y",
         ]
     ) == 0
@@ -920,11 +1004,11 @@ def test_pipeline_add_op_model_writes_inline_litert_metadata(tmp_path):
             "pipeline",
             "add-op",
             str(pipeline),
-            "run_model_inference",
+            "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
             "--input",
             "input",
-            "--output",
-            "scores",
+            "--named-output",
+            "scores=scores",
             "--model",
             "model/demo.tflite",
             "--model-name",
@@ -933,21 +1017,36 @@ def test_pipeline_add_op_model_writes_inline_litert_metadata(tmp_path):
     ) == 0
 
     op = json.loads(pipeline.read_text(encoding="utf-8"))["operators"][0]
-    assert op["model_type"] == "tflite"
     assert op["model"]["bin_path"] == "model/demo.tflite"
+    assert op["model"]["model_type"] == "tflite"
+    assert "model_type" not in op
     assert "model_file" not in op
     assert "model_asset" not in op
     assert "model_id" not in op
 
 
-def test_pipeline_add_op_accepts_spatial_only_aliases(tmp_path):
+def test_pipeline_add_op_accepts_spatial_only_canonical_types(tmp_path):
     pipeline = tmp_path / "pipeline.json"
     assert cli_module.main(["pipeline", "init", str(pipeline)]) == 0
     assert cli_module.main(
-        ["pipeline", "add-tensor", str(pipeline), "scene", "--shape", "1,1", "--dtype", "uint8"]
+        ["pipeline", "add-tensor", str(pipeline), "scene", "--shape", "1,1", "--dtype", "uint8", "--usage", "gltf"]
     ) == 0
     assert cli_module.main(
         ["pipeline", "add-tensor", str(pipeline), "scale", "--shape", "1,3", "--dtype", "float32"]
+    ) == 0
+    assert cli_module.main(
+        [
+            "pipeline",
+            "add-tensor",
+            str(pipeline),
+            "visible",
+            "--shape",
+            "1",
+            "--dtype",
+            "int32",
+            "--usage",
+            "scalar",
+        ]
     ) == 0
 
     assert cli_module.main(
@@ -955,11 +1054,11 @@ def test_pipeline_add_op_accepts_spatial_only_aliases(tmp_path):
             "pipeline",
             "add-op",
             str(pipeline),
-            "scenegraph_visibility",
-            "--input",
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+            "--scenegraph",
             "scene",
-            "--attr",
-            "false",
+            "--visible",
+            "visible",
         ]
     ) == 0
     assert cli_module.main(
@@ -967,10 +1066,10 @@ def test_pipeline_add_op_accepts_spatial_only_aliases(tmp_path):
             "pipeline",
             "add-op",
             str(pipeline),
-            "update_component",
-            "--input",
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+            "--scenegraph",
             "scene",
-            "--input",
+            "--data",
             "scale",
             "--entity-path",
             "/target",
@@ -980,12 +1079,10 @@ def test_pipeline_add_op_accepts_spatial_only_aliases(tmp_path):
     ) == 0
 
     operators = json.loads(pipeline.read_text(encoding="utf-8"))["operators"]
-    assert operators[0]["type"] == "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO"
-    assert operators[0]["visible"] is False
-    assert operators[1]["type"] == "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO"
-    assert operators[1]["data"] == "scale"
-    assert operators[1]["entity_path"] == "/target"
-    assert operators[1]["property"] == "Transform.Scale"
+    assert operators[0]["type"] == "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO"
+    assert "attrs" not in operators[0]
+    assert operators[1]["type"] == "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO"
+    assert operators[1]["attrs"] == ["/target:Transform.Scale"]
 
 
 def test_pipeline_command_reports_builder_errors(capsys, tmp_path):
@@ -1038,7 +1135,7 @@ def test_pipeline_trace_writes_pipeline_from_decorated_function(tmp_path):
     assert spec["inputs"] == ["image"]
     assert spec["outputs"] == ["normalized"]
     assert len(spec["operators"]) == 1
-    assert spec["operators"][0]["expression"] == "{0} / 255.0"
+    assert spec["operators"][0]["attrs"] == ["{0} / 255.0"]
 
 
 def test_package_create_validate_and_inspect_commands(capsys, tmp_path):
@@ -1048,22 +1145,27 @@ def test_package_create_validate_and_inspect_commands(capsys, tmp_path):
     pipeline.write_text(
         json.dumps(
             {
-                "tensors": {},
+                "tensors": {
+                    "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                    "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                },
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                        "inputs": [],
-                        "outputs": [],
-                        "model_type": "tflite",
+                        "inputs": [{"tensor": "input"}],
+                        "outputs": [{"tensor": "output"}],
                         "model": {
                             "bin_path": "face.tflite",
                             "model_name": "face",
                             "model_type": "tflite",
+                            "model_target": "cpu",
+                            "input": [{"name": "input", "shape": [1, 1], "encoding_type": "float32"}],
+                            "output": [{"name": "output", "shape": [1, 1], "encoding_type": "float32"}],
                         },
                     }
                 ],
-                "inputs": [],
-                "outputs": [],
+                "inputs": ["input"],
+                "outputs": ["output"],
             }
         ),
         encoding="utf-8",
@@ -1103,22 +1205,27 @@ def test_package_create_from_existing_source_package(tmp_path):
     pipeline.write_text(
         json.dumps(
             {
-                "tensors": {},
+                "tensors": {
+                    "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                    "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                },
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                        "inputs": [],
-                        "outputs": [],
-                        "model_type": "tflite",
+                        "inputs": [{"tensor": "input"}],
+                        "outputs": [{"tensor": "output"}],
                         "model": {
                             "bin_path": "face.tflite",
                             "model_name": "face",
                             "model_type": "tflite",
+                            "model_target": "cpu",
+                            "input": [{"name": "input", "shape": [1, 1], "encoding_type": "float32"}],
+                            "output": [{"name": "output", "shape": [1, 1], "encoding_type": "float32"}],
                         },
                     }
                 ],
-                "inputs": [],
-                "outputs": [],
+                "inputs": ["input"],
+                "outputs": ["output"],
             }
         ),
         encoding="utf-8",
@@ -1157,22 +1264,27 @@ def test_package_inspect_json(capsys, tmp_path):
     pipeline.write_text(
         json.dumps(
             {
-                "tensors": {},
+                "tensors": {
+                    "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                    "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                },
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                        "inputs": [],
-                        "outputs": [],
-                        "model_type": "tflite",
+                        "inputs": [{"tensor": "input"}],
+                        "outputs": [{"tensor": "output"}],
                         "model": {
                             "bin_path": "face.tflite",
                             "model_name": "face",
                             "model_type": "tflite",
+                            "model_target": "cpu",
+                            "input": [{"name": "input", "shape": [1, 1], "encoding_type": "float32"}],
+                            "output": [{"name": "output", "shape": [1, 1], "encoding_type": "float32"}],
                         },
                     }
                 ],
-                "inputs": [],
-                "outputs": [],
+                "inputs": ["input"],
+                "outputs": ["output"],
             }
         ),
         encoding="utf-8",
@@ -1260,22 +1372,27 @@ def test_package_create_yes_overwrites_existing_output(tmp_path):
     pipeline.write_text(
         json.dumps(
             {
-                "tensors": {},
+                "tensors": {
+                    "input": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                    "output": {"dimensions": [1, 1], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                },
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                        "inputs": [],
-                        "outputs": [],
-                        "model_type": "tflite",
+                        "inputs": [{"tensor": "input"}],
+                        "outputs": [{"tensor": "output"}],
                         "model": {
                             "bin_path": "face.tflite",
                             "model_name": "face",
                             "model_type": "tflite",
+                            "model_target": "cpu",
+                            "input": [{"name": "input", "shape": [1, 1], "encoding_type": "float32"}],
+                            "output": [{"name": "output", "shape": [1, 1], "encoding_type": "float32"}],
                         },
                     }
                 ],
-                "inputs": [],
-                "outputs": [],
+                "inputs": ["input"],
+                "outputs": ["output"],
             }
         ),
         encoding="utf-8",
@@ -1328,9 +1445,9 @@ def test_run_host_command_runs_pipeline_and_saves_outputs(capsys, tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["x"],
-                        "outputs": ["y"],
-                        "expression": "{0} + 3.0",
+                        "inputs": [{"tensor": "x"}] + [None] * 9,
+                        "outputs": [{"tensor": "y"}],
+            "attrs": ["{0} + 3.0"],
                     }
                 ],
                 "inputs": ["x"],
@@ -1390,9 +1507,9 @@ def test_run_host_command_json_wraps_summary(capsys, tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["x"],
-                        "outputs": ["y"],
-                        "expression": "{0} + 3.0",
+                        "inputs": [{"tensor": "x"}] + [None] * 9,
+                        "outputs": [{"tensor": "y"}],
+                        "attrs": ["{0} + 3.0"],
                     }
                 ],
                 "inputs": ["x"],
@@ -1464,6 +1581,9 @@ def test_run_host_command_runs_model_operator_with_litert(monkeypatch, tmp_path)
                             "bin_path": "demo.tflite",
                             "model_name": "demo",
                             "model_type": "tflite",
+                            "model_target": "cpu",
+                            "input": [{"name": "input", "shape": [2, 2], "encoding_type": "float32"}],
+                            "output": [{"name": "scores", "shape": [2, 2], "encoding_type": "float32"}],
                         },
                     }
                 ],
@@ -1526,9 +1646,9 @@ def test_run_host_command_dump_all(tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["x"],
-                        "outputs": ["y"],
-                        "expression": "{0} * 2.0",
+                        "inputs": [{"tensor": "x"}] + [None] * 9,
+                        "outputs": [{"tensor": "y"}],
+                        "attrs": ["{0} * 2.0"],
                     }
                 ],
                 "inputs": ["x"],
@@ -1583,16 +1703,20 @@ def test_run_host_command_writes_display_summary(tmp_path):
                         "usage": 6,
                     },
                     "frame_gltf": {
-                        "tensor_type": "gltf",
+                        "dimensions": [1, 1],
+                        "channels": 1,
+                        "data_type": 1,
+                        "is_gltf": True,
                         "asset": "gltf/frame.gltf",
                         "is_placeholder": True,
+                        "usage": 7,
                     },
                 },
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-                        "inputs": ["pose_in"],
-                        "outputs": ["frame_pose"],
+                        "inputs": [{"tensor": "pose_in"}],
+                        "outputs": [{"tensor": "frame_pose"}],
                     }
                 ],
                 "inputs": ["pose_in"],
@@ -1651,8 +1775,8 @@ def test_run_host_command_writes_post_det_json(tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-                        "inputs": ["post_det_input"],
-                        "outputs": ["post_det"],
+                        "inputs": [{"tensor": "post_det_input"}],
+                        "outputs": [{"tensor": "post_det"}],
                     }
                 ],
                 "inputs": ["post_det_input"],
@@ -1712,9 +1836,9 @@ def test_run_host_command_runs_package_pipeline_chain(tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["x"],
-                        "outputs": ["y"],
-                        "expression": "{0} * 2.0",
+                        "inputs": [{"tensor": "x"}] + [None] * 9,
+                        "outputs": [{"tensor": "y"}],
+                        "attrs": ["{0} * 2.0"],
                     }
                 ],
                 "inputs": ["x"],
@@ -1745,9 +1869,9 @@ def test_run_host_command_runs_package_pipeline_chain(tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["y"],
-                        "outputs": ["z"],
-                        "expression": "{0} + 3.0",
+                        "inputs": [{"tensor": "y"}] + [None] * 9,
+                        "outputs": [{"tensor": "z"}],
+                        "attrs": ["{0} + 3.0"],
                     }
                 ],
                 "inputs": ["y"],
@@ -1819,9 +1943,9 @@ def test_run_host_command_rejects_duplicate_pipeline_ids(capsys, tmp_path):
                 "operators": [
                     {
                         "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                        "inputs": ["x"],
-                        "outputs": ["y"],
-                        "expression": "{0}",
+                        "inputs": [{"tensor": "x"}] + [None] * 9,
+                        "outputs": [{"tensor": "y"}],
+                        "attrs": ["{0}"],
                     }
                 ],
                 "inputs": ["x"],

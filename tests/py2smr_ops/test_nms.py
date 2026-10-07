@@ -16,12 +16,29 @@
 import numpy as np
 import pytest
 
-from securemr.py2smr import trace, ops, convert
-from .conftest import run_op_test, skip_if_no_device
+from securemr.py2smr import trace, ops, convert, verify
+from .conftest import skip_if_no_device
 
 
 class TestNMS:
     """Tests for NMS operation."""
+
+    @staticmethod
+    def _run_nms_test(traced_func, inputs, *, test_device=False, device_duration=10):
+        """Verify the helper's kept-index output, serialized in NMS slot 2."""
+        result, ctx = traced_func.trace(**inputs)
+        spec = convert(ctx)
+        expected_indices = np.asarray(result, dtype=np.int32)
+        verification = verify(
+            pipeline=spec,
+            inputs=inputs,
+            expected_outputs={"output": expected_indices},
+            device=test_device,
+            duration=device_duration,
+        )
+        if test_device and verification.error_message == "Device verification is not available":
+            pytest.skip("Python verifier device execution is not available")
+        return result, verification
 
     def test_serializes_scores_before_boxes(self):
         """NMS JSON input order must match the v2 loader contract."""
@@ -34,7 +51,7 @@ class TestNMS:
         _, ctx = traced_nms.trace(scores=scores, boxes=boxes)
 
         spec = convert(ctx)
-        assert spec["operators"][0]["inputs"] == ["scores", "boxes"]
+        assert spec["operators"][0]["inputs"] == [{"tensor": "scores"}, {"tensor": "boxes"}]
 
     def test_basic_nms(self):
         """Test basic NMS with overlapping boxes."""
@@ -50,10 +67,8 @@ class TestNMS:
         ], dtype=np.float32)
         scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
-        result, verification = run_op_test(
-            basic_nms,
-            {"scores": scores, "boxes": boxes},
-            "output",
+        result, verification = self._run_nms_test(
+            basic_nms, {"scores": scores, "boxes": boxes}
         )
 
         assert verification.success, verification.error_message
@@ -74,10 +89,8 @@ class TestNMS:
         ], dtype=np.float32)
         scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
-        result, verification = run_op_test(
-            no_overlap_nms,
-            {"scores": scores, "boxes": boxes},
-            "output",
+        result, verification = self._run_nms_test(
+            no_overlap_nms, {"scores": scores, "boxes": boxes}
         )
 
         assert verification.success, verification.error_message
@@ -97,10 +110,8 @@ class TestNMS:
         ], dtype=np.float32)
         scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
-        result, verification = run_op_test(
-            high_thresh_nms,
-            {"scores": scores, "boxes": boxes},
-            "output",
+        result, verification = self._run_nms_test(
+            high_thresh_nms, {"scores": scores, "boxes": boxes}
         )
 
         assert verification.success, verification.error_message
@@ -118,10 +129,8 @@ class TestNMS:
         ], dtype=np.float32)
         scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
-        result, verification = run_op_test(
-            low_thresh_nms,
-            {"scores": scores, "boxes": boxes},
-            "output",
+        result, verification = self._run_nms_test(
+            low_thresh_nms, {"scores": scores, "boxes": boxes}
         )
 
         assert verification.success, verification.error_message
@@ -135,10 +144,8 @@ class TestNMS:
         boxes = np.array([[10, 10, 20, 20]], dtype=np.float32)
         scores = np.array([0.9], dtype=np.float32)
 
-        result, verification = run_op_test(
-            single_nms,
-            {"scores": scores, "boxes": boxes},
-            "output",
+        result, verification = self._run_nms_test(
+            single_nms, {"scores": scores, "boxes": boxes}
         )
 
         assert verification.success, verification.error_message
@@ -159,10 +166,9 @@ class TestNMS:
         ], dtype=np.float32)
         scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
 
-        result, verification = run_op_test(
+        result, verification = self._run_nms_test(
             device_nms,
             {"scores": scores, "boxes": boxes},
-            "output",
             test_device=True,
             device_duration=10,
         )

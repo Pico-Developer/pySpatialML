@@ -68,9 +68,9 @@ def _simple_pipeline():
         "operators": [
             {
                 "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                "inputs": ["x"],
-                "outputs": ["y"],
-                "expression": "{0} * 2.0",
+                "inputs": [{"tensor": "x"}] + [None] * 9,
+                "outputs": [{"tensor": "y"}],
+                "attrs": ["{0} * 2.0"],
             }
         ],
         "inputs": ["x"],
@@ -99,9 +99,9 @@ def _second_pipeline():
         "operators": [
             {
                 "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                "inputs": ["y"],
-                "outputs": ["z"],
-                "expression": "{0} + 3.0",
+                "inputs": [{"tensor": "y"}] + [None] * 9,
+                "outputs": [{"tensor": "z"}],
+                "attrs": ["{0} + 3.0"],
             }
         ],
         "inputs": ["y"],
@@ -175,8 +175,8 @@ def test_run_host_summary_marks_all_zero_and_truncated_preview(capsys, tmp_path)
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-                    "inputs": ["x"],
-                    "outputs": ["y"],
+                    "inputs": [{"tensor": "x"}],
+                    "outputs": [{"tensor": "y"}],
                 }
             ],
             "inputs": ["x"],
@@ -192,7 +192,7 @@ def test_run_host_summary_marks_all_zero_and_truncated_preview(capsys, tmp_path)
     assert "preview=[0, 0, 0, 0, 0, 0, 0, 0, ...]" in captured.out
 
 
-def test_run_host_accepts_schema_v2_generic_elementwise(tmp_path):
+def test_run_host_accepts_schema_v2_named_elementwise_operator(tmp_path):
     pipeline = tmp_path / "pipeline.json"
     a = tmp_path / "a.npy"
     b = tmp_path / "b.npy"
@@ -205,7 +205,7 @@ def test_run_host_accepts_schema_v2_generic_elementwise(tmp_path):
                 "b": {"dimensions": [2, 2], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
                 "y": {"dimensions": [2, 2], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
             },
-            "operators": [{"type": "elementwise", "op": "multiply", "inputs": ["a", "b"], "outputs": ["y"]}],
+            "operators": [{"type": "XR_SECURE_MR_OPERATOR_TYPE_ELEMENTWISE_MULTIPLY_PICO", "inputs": [{"tensor": "a"}, {"tensor": "b"}], "outputs": [{"tensor": "y"}]}],
             "inputs": ["a", "b"],
             "outputs": ["y"],
         },
@@ -242,8 +242,11 @@ def test_run_host_preserves_supplied_rectified_vst_outputs(tmp_path):
                     "usage": 6,
                 },
                 "vst_timestamp": {
-                    "tensor_type": "timestamp",
+                    "dimensions": [1],
+                    "channels": 4,
+                    "data_type": 5,
                     "is_placeholder": True,
+                    "usage": 5,
                 },
                 "vst_camera_matrix": {
                     "dimensions": [3, 3],
@@ -258,10 +261,10 @@ def test_run_host_preserves_supplied_rectified_vst_outputs(tmp_path):
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO",
                     "inputs": [],
                     "outputs": [
-                        "vst_right_image",
-                        "vst_left_image",
-                        "vst_timestamp",
-                        "vst_camera_matrix",
+                        {"tensor": "vst_right_image"},
+                        {"tensor": "vst_left_image"},
+                        {"tensor": "vst_timestamp"},
+                        {"tensor": "vst_camera_matrix"},
                     ],
                 }
             ],
@@ -317,7 +320,7 @@ def test_run_host_resizes_supplied_image_input_to_tensor_shape(tmp_path):
     assert run_cli.run_host(_package_pipeline(tmp_path, pipeline), inputs=[f"vst_left_image={left}"], output_dir=output_dir) == 0
 
     output = np.load(_package_output(output_dir) / "vst_left_image.npy")
-    assert output.shape == (3, 4, 3)
+    assert output.shape == (4, 3, 3)
     assert output.dtype == np.uint8
 
 
@@ -332,14 +335,14 @@ def test_run_host_bare_image_input_feeds_rectified_vst(tmp_path):
             "tensors": {
                 "vst_right_image": {"dimensions": [2, 3], "channels": 3, "data_type": 1, "is_placeholder": True, "usage": 6},
                 "vst_left_image": {"dimensions": [2, 3], "channels": 3, "data_type": 1, "is_placeholder": True, "usage": 6},
-                "vst_timestamp": {"dimensions": [1, 1], "channels": 4, "data_type": 5, "is_placeholder": True, "usage": 6},
+                "vst_timestamp": {"dimensions": [1], "channels": 4, "data_type": 5, "is_placeholder": True, "usage": 5},
                 "vst_camera_matrix": {"dimensions": [3, 3], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
             },
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_RECTIFIED_VST_ACCESS_PICO",
                     "inputs": [],
-                    "outputs": ["vst_right_image", "vst_left_image", "vst_timestamp", "vst_camera_matrix"],
+                    "outputs": [{"tensor": "vst_right_image"}, {"tensor": "vst_left_image"}, {"tensor": "vst_timestamp"}, {"tensor": "vst_camera_matrix"}],
                 }
             ],
             "inputs": [],
@@ -410,9 +413,9 @@ def test_run_host_bare_input_feeds_declared_input_tensor(tmp_path):
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
-                    "inputs": ["x"],
-                    "outputs": ["y"],
-                    "expression": "{0} * 2.0",
+                    "inputs": [{"tensor": "x"}] + [None] * 9,
+                    "outputs": [{"tensor": "y"}],
+                    "attrs": ["{0} * 2.0"],
                 }
             ],
             "inputs": ["x"],
@@ -462,6 +465,8 @@ def test_run_host_model_operator_uses_litert_runner(monkeypatch, capsys, tmp_pat
                         "model_name": "demo",
                         "model_type": "tflite",
                         "model_target": "npu",
+                        "input": [{"name": "input", "shape": [2, 2], "encoding_type": "FP32"}],
+                        "output": [{"name": "scores", "shape": [2, 2], "encoding_type": "FP32"}],
                     },
                 }
             ],
@@ -498,7 +503,6 @@ def test_run_host_normalizes_model_target_to_cpu():
         "operators": [
             {
                 "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                "model_target": "npu",
                 "model": {"bin_path": "demo.tflite", "model_target": "npu"},
             }
         ]
@@ -506,8 +510,8 @@ def test_run_host_normalizes_model_target_to_cpu():
 
     normalized = run_cli._normalize_run_pipeline_spec(spec)
 
-    assert normalized["operators"][0]["model_target"] == "cpu"
     assert normalized["operators"][0]["model"]["model_target"] == "cpu"
+    assert "model_target" not in normalized["operators"][0]
 
 
 def test_run_host_model_operator_reports_litert_failure(monkeypatch, tmp_path):
@@ -527,7 +531,7 @@ def test_run_host_model_operator_reports_litert_failure(monkeypatch, tmp_path):
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
                     "inputs": [{"name": "input", "tensor": "x"}],
                     "outputs": [{"name": "scores", "tensor": "scores"}],
-                    "model": {"bin_path": "demo.tflite", "model_name": "demo", "model_type": "tflite"},
+                    "model": {"bin_path": "demo.tflite", "model_name": "demo", "model_type": "tflite", "model_target": "cpu", "input": [{"name": "input", "shape": [1, 1], "encoding_type": "FP32"}], "output": [{"name": "scores", "shape": [1, 1], "encoding_type": "FP32"}]},
                 }
             ],
             "inputs": ["x"],
@@ -649,16 +653,20 @@ def test_run_host_writes_display_summary_for_pose_and_gltf(capsys, tmp_path):
                     "usage": 6,
                 },
                 "frame_gltf": {
-                    "tensor_type": "gltf",
+                    "dimensions": [1, 1],
+                    "channels": 1,
+                    "data_type": 1,
+                    "is_gltf": True,
                     "asset": "gltf/frame.gltf",
                     "is_placeholder": True,
+                    "usage": 7,
                 },
             },
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-                    "inputs": ["pose_in"],
-                    "outputs": ["frame_pose"],
+                    "inputs": [{"tensor": "pose_in"}],
+                    "outputs": [{"tensor": "frame_pose"}],
                 }
             ],
             "inputs": ["pose_in"],
@@ -739,8 +747,8 @@ def test_run_host_decodes_post_det_output(capsys, tmp_path):
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO",
-                    "inputs": ["post_det_input"],
-                    "outputs": ["post_det"],
+                    "inputs": [{"tensor": "post_det_input"}],
+                    "outputs": [{"tensor": "post_det"}],
                 }
             ],
             "inputs": ["post_det_input"],
@@ -1025,7 +1033,19 @@ def test_run_device_invokes_spatial_runner_script(monkeypatch, tmp_path):
     assert cmd[0] == run_cli.sys.executable
     assert cmd[1] == str(script)
     assert cmd[2] == str(package)
-    assert "--duration" in cmd and "15.0" in cmd
+
+
+@pytest.mark.parametrize("values, expected", [
+    ([], []),
+    (["", " detection ", "  "], ["detection"]),
+])
+def test_run_device_normalizes_empty_pipeline_ids(values, expected):
+    assert run_cli._normalize_pipeline_ids(values) == expected
+
+
+def test_xr_runner_normalizes_empty_pipeline_ids():
+    runner = _load_xr_runner_script()
+    assert runner.normalize_pipeline_ids(["", " detection ", "  ", "display"]) == ["detection", "display"]
 
 
 def test_run_device_auto_selects_spatial_runner_by_default(monkeypatch, tmp_path):
@@ -1151,6 +1171,22 @@ def test_xr_runner_prepare_package_rejects_zip_path_traversal(tmp_path):
 
     with pytest.raises(SystemExit, match="Unsafe zip entry path"):
         runner.prepare_package(archive, tmp_path / "extract")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["/tmp/model.tflite", "C:\\model.tflite", "\\\\server\\share\\model.tflite", "../model.tflite", "model//file.tflite", "model/", "./model.tflite"],
+)
+def test_xr_runner_rejects_unsafe_package_paths(tmp_path, value):
+    runner = _load_xr_runner_script()
+    with pytest.raises(SystemExit, match="package-relative|invalid path component|escapes"):
+        runner.resolve_package_path(tmp_path, value, label="model.bin_path")
+
+
+def test_xr_runner_resolves_safe_package_paths(tmp_path):
+    runner = _load_xr_runner_script()
+    resolved = runner.resolve_package_path(tmp_path, "model/model.tflite", label="model.bin_path")
+    assert resolved == (tmp_path / "model" / "model.tflite").resolve()
     assert not (tmp_path.parent / "evil.txt").exists()
 
 
@@ -1210,7 +1246,6 @@ def test_xr_runner_override_model_backend_patches_staged_package(tmp_path):
             "operators": [
                 {
                     "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
-                    "model_target": "npu",
                     "model": {"model_target": "npu"},
                 },
                 {"type": "XR_SECURE_MR_OPERATOR_TYPE_ASSIGNMENT_PICO"},
@@ -1221,9 +1256,41 @@ def test_xr_runner_override_model_backend_patches_staged_package(tmp_path):
     result = runner.override_model_backend(package, "gpu", tmp_path)
 
     spec = json.loads((result / "pipeline" / "main.json").read_text(encoding="utf-8"))
-    assert spec["operators"][0]["model_target"] == "gpu"
     assert spec["operators"][0]["model"]["model_target"] == "gpu"
+    assert "model_target" not in spec["operators"][0]
     assert "model_target" not in spec["operators"][1]
+    assert runner.collect_model_backends(result) == ["gpu"]
+
+
+def test_device_runner_override_model_backend_accepts_authoring_alias(tmp_path):
+    package = tmp_path / "pkg"
+    pipeline_dir = package / "pipeline"
+    pipeline_dir.mkdir(parents=True)
+    _write_json(
+        package / "manifest.json",
+        {
+            "id": "demo",
+            "pipelines": [{"id": "main", "path": "pipeline/main.json"}],
+        },
+    )
+    _write_json(
+        pipeline_dir / "main.json",
+        {
+            "operators": [
+                {
+                    "type": "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO",
+                    "model": {"model_target": "npu"},
+                }
+            ]
+        },
+    )
+
+    result = device_runner_base.override_model_backend(package, "gpu", tmp_path)
+
+    spec = json.loads((result / "pipeline" / "main.json").read_text(encoding="utf-8"))
+    assert spec["operators"][0]["model"]["model_target"] == "gpu"
+    assert "model_target" not in spec["operators"][0]
+    assert device_runner_base.collect_model_backends(result) == ["gpu"]
 
 
 def test_spatial_runner_does_not_rewrite_v2_package_metadata(tmp_path):
@@ -1253,7 +1320,157 @@ def test_spatial_runner_does_not_rewrite_v2_package_metadata(tmp_path):
     assert json.loads((pipeline_dir / "main.json").read_text(encoding="utf-8")) == before_pipeline
 
 
-def test_spatial_runner_preflight_accepts_update_component(tmp_path):
+def test_spatial_runner_compacts_arithmetic_slots_only_in_staging_copy(tmp_path):
+    package = tmp_path / "pkg"
+    pipeline_dir = package / "pipeline"
+    pipeline_dir.mkdir(parents=True)
+    _write_json(
+        package / "manifest.json",
+        {
+            "schema_version": "2",
+            "id": "demo",
+            "pipelines": [{"id": "main", "path": "pipeline/main.json"}],
+        },
+    )
+    pipeline = {
+        "tensors": {},
+        "operators": [
+            {
+                "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
+                "inputs": [{"tensor": "a"}, None, {"tensor": "b"}, None],
+                "outputs": [{"tensor": "out"}],
+                "attrs": ["{0} + {2}"],
+            }
+        ],
+        "inputs": [],
+        "outputs": [],
+    }
+    _write_json(pipeline_dir / "main.json", pipeline)
+
+    staged = device_runner_base.normalize_spatial_loader_compatibility(package, tmp_path / "staging")
+
+    assert staged != package
+    assert json.loads((package / "pipeline/main.json").read_text(encoding="utf-8")) == pipeline
+    staged_operator = json.loads((staged / "pipeline/main.json").read_text(encoding="utf-8"))["operators"][0]
+    assert staged_operator["inputs"] == [{"tensor": "a"}, {"tensor": "b"}]
+    assert staged_operator["attrs"] == ["{0} + {1}"]
+
+
+def test_spatial_runner_rejects_arithmetic_expression_referencing_null_slot(tmp_path):
+    package = tmp_path / "pkg"
+    pipeline_dir = package / "pipeline"
+    pipeline_dir.mkdir(parents=True)
+    _write_json(
+        package / "manifest.json",
+        {"pipelines": [{"id": "main", "path": "pipeline/main.json"}]},
+    )
+    _write_json(
+        pipeline_dir / "main.json",
+        {
+            "operators": [
+                {
+                    "type": "XR_SECURE_MR_OPERATOR_TYPE_ARITHMETIC_COMPOSE_PICO",
+                    "inputs": [{"tensor": "a"}, None],
+                    "attrs": ["{1}"],
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="references null input slot 1"):
+        device_runner_base.normalize_spatial_loader_compatibility(package, tmp_path / "staging")
+
+
+def test_spatial_runner_aliases_js_scripting_only_in_staging_copy(tmp_path):
+    package = tmp_path / "pkg"
+    pipeline_dir = package / "pipeline"
+    pipeline_dir.mkdir(parents=True)
+    _write_json(
+        package / "manifest.json",
+        {"pipelines": [{"id": "main", "path": "pipeline/main.json"}]},
+    )
+    pipeline = {
+        "operators": [
+            {
+                "type": "XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO",
+                "inputs": [{"name": "input", "tensor": "x"}],
+                "outputs": [{"name": "output", "tensor": "y"}],
+                "attrs": ["var input; var output; output[0] = input[0];"],
+            }
+        ]
+    }
+    _write_json(pipeline_dir / "main.json", pipeline)
+
+    staged = device_runner_base.normalize_spatial_loader_compatibility(package, tmp_path / "staging")
+
+    assert json.loads((package / "pipeline/main.json").read_text(encoding="utf-8")) == pipeline
+    staged_operator = json.loads((staged / "pipeline/main.json").read_text(encoding="utf-8"))["operators"][0]
+    assert staged_operator["type"] == "XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO"
+    assert staged_operator["inputs"] == pipeline["operators"][0]["inputs"]
+    assert staged_operator["outputs"] == pipeline["operators"][0]["outputs"]
+    assert staged_operator["attrs"] == pipeline["operators"][0]["attrs"]
+
+
+@pytest.mark.parametrize(
+    ("canonical_type", "loader_type"),
+    [
+        (
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+            "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
+        ),
+        (
+            "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+            "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
+        ),
+    ],
+)
+def test_spatial_runner_aliases_canonical_scene_ops_only_in_staging_copy(
+    tmp_path, canonical_type, loader_type
+):
+    package = tmp_path / "pkg"
+    pipeline_dir = package / "pipeline"
+    pipeline_dir.mkdir(parents=True)
+    _write_json(
+        package / "manifest.json",
+        {"pipelines": [{"id": "scene", "path": "pipeline/scene.json"}]},
+    )
+    pipeline = {
+        "operators": [
+            {
+                "type": canonical_type,
+                "inputs": [{"tensor": "scene"}, {"tensor": "value"}],
+                "outputs": [],
+                "attrs": ["/target:Transform.Scale"]
+                if canonical_type.endswith("UPDATE_COMPONENT_PICO")
+                else [],
+            }
+        ]
+    }
+    _write_json(pipeline_dir / "scene.json", pipeline)
+
+    staged = device_runner_base.normalize_spatial_loader_compatibility(
+        package, tmp_path / "staging"
+    )
+
+    assert staged != package
+    assert json.loads((package / "pipeline/scene.json").read_text(encoding="utf-8")) == pipeline
+    staged_operator = json.loads(
+        (staged / "pipeline/scene.json").read_text(encoding="utf-8")
+    )["operators"][0]
+    assert staged_operator["type"] == loader_type
+    assert staged_operator["inputs"] == pipeline["operators"][0]["inputs"]
+    assert staged_operator["outputs"] == pipeline["operators"][0]["outputs"]
+    assert staged_operator["attrs"] == pipeline["operators"][0]["attrs"]
+
+
+@pytest.mark.parametrize(
+    "operator_type",
+    [
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+        "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
+    ],
+)
+def test_spatial_runner_preflight_accepts_update_component(tmp_path, operator_type):
     package = tmp_path / "pkg"
     pipeline_dir = package / "pipeline"
     pipeline_dir.mkdir(parents=True)
@@ -1271,20 +1488,21 @@ def test_spatial_runner_preflight_accepts_update_component(tmp_path):
         {
             "tensors": {
                 "frame_gltf": {
-                    "tensor_type": "gltf",
+                    "dimensions": [1, 1],
+                    "channels": 1,
+                    "data_type": 1,
+                    "is_gltf": True,
                     "asset": "gltf/frame.gltf",
                     "is_placeholder": True,
-                }
-                ,"scale": {"dimensions": [1, 3], "channels": 1, "data_type": 6}
+                    "usage": 7,
+                },
+                "scale": {"dimensions": [1, 3], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6}
             },
             "operators": [
                 {
-                    "type": "update_component",
-                    "scenegraph": "frame_gltf",
-                    "entity_path": "/target",
-                    "property": "Transform.Scale",
-                    "data": "scale",
-                    "inputs": ["frame_gltf", "scale"],
+                    "type": operator_type,
+                    "attrs": ["/target:Transform.Scale"],
+                    "inputs": [{"tensor": "frame_gltf"}, {"tensor": "scale"}],
                     "outputs": [],
                 }
             ],
@@ -1304,6 +1522,15 @@ def test_spatial_runner_main_stages_update_component(monkeypatch, tmp_path):
     apk.write_bytes(b"apk")
     calls = []
     monkeypatch.setattr(device_runner_base, "run", lambda cmd, **_kwargs: calls.append(cmd))
+    monkeypatch.setattr(
+        device_runner_base,
+        "run_as_capture",
+        lambda *_args, **_kwargs: json.dumps({"state": "complete", "mode": "spatial"}),
+    )
+    monkeypatch.setattr(
+        device_runner_base, "pull_app_outputs", lambda *_args, **_kwargs: tmp_path / "outputs"
+    )
+    monkeypatch.setattr(device_runner_base, "print_device_summary", lambda *_args, **_kwargs: None)
 
     _write_json(
         package / "manifest.json",
@@ -1319,20 +1546,21 @@ def test_spatial_runner_main_stages_update_component(monkeypatch, tmp_path):
         {
             "tensors": {
                 "frame_gltf": {
-                    "tensor_type": "gltf",
+                    "dimensions": [1, 1],
+                    "channels": 1,
+                    "data_type": 1,
+                    "is_gltf": True,
                     "asset": "gltf/frame.gltf",
                     "is_placeholder": True,
-                }
-                ,"scale": {"dimensions": [1, 3], "channels": 1, "data_type": 6}
+                    "usage": 7,
+                },
+                "scale": {"dimensions": [1, 3], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6}
             },
             "operators": [
                 {
-                    "type": "update_component",
-                    "scenegraph": "frame_gltf",
-                    "entity_path": "/target",
-                    "property": "Transform.Scale",
-                    "data": "scale",
-                    "inputs": ["frame_gltf", "scale"],
+                    "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+                    "attrs": ["/target:Transform.Scale"],
+                    "inputs": [{"tensor": "frame_gltf"}, {"tensor": "scale"}],
                     "outputs": [],
                 }
             ],
@@ -1343,6 +1571,7 @@ def test_spatial_runner_main_stages_update_component(monkeypatch, tmp_path):
 
     device_runner_base.main(device_runner_base.SPATIAL_CONFIG, [str(package), "--apk", str(apk)])
     assert calls
+    assert ["adb", "shell", "setprop", "debug.pyspatialml.spatial_runner.use_vst", "true"] in calls
 
 
 def test_spatial_runner_preflight_accepts_scenegraph_visibility(tmp_path):
@@ -1363,17 +1592,19 @@ def test_spatial_runner_preflight_accepts_scenegraph_visibility(tmp_path):
         {
             "tensors": {
                 "frame_gltf": {
-                    "tensor_type": "gltf",
+                    "dimensions": [1, 1],
+                    "channels": 1,
+                    "data_type": 1,
+                    "is_gltf": True,
                     "asset": "gltf/frame.gltf",
                     "is_placeholder": True,
+                    "usage": 6,
                 }
             },
             "operators": [
                 {
-                    "type": "scenegraph_visibility",
-                    "scenegraph": "frame_gltf",
-                    "visible": False,
-                    "inputs": ["frame_gltf"],
+                    "type": "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+                    "inputs": [{"tensor": "frame_gltf"}, None],
                     "outputs": [],
                 }
             ],
@@ -1429,8 +1660,8 @@ def test_device_runner_collects_gltf_output_metadata(tmp_path):
         pipeline_dir / "display.json",
         {
             "tensors": {
-                "frame_pose": {"dimensions": [4, 4], "channels": 1, "data_type": 6},
-                "frame_gltf": {"tensor_type": "gltf", "asset": "gltf/frame.gltf"},
+                "frame_pose": {"dimensions": [4, 4], "channels": 1, "data_type": 6, "is_placeholder": True, "usage": 6},
+                "frame_gltf": {"dimensions": [1, 1], "channels": 1, "data_type": 1, "is_gltf": True, "asset": "gltf/frame.gltf", "is_placeholder": True, "usage": 6},
             },
             "outputs": ["frame_pose", "frame_gltf"],
         },
@@ -1477,6 +1708,22 @@ def test_xr_runner_parse_input_args_supports_bare_and_named(tmp_path):
 
     assert defaults == [image]
     assert named == [("vst_left_image", left)]
+
+
+def test_xr_runner_uses_vst_by_default_without_input():
+    runner = _load_xr_runner_script()
+
+    assert runner.should_use_vst(None, False) is True
+    assert runner.should_use_vst([], False) is True
+    assert runner.should_use_vst(["image.jpg"], False) is False
+    assert runner.should_use_vst(["image.jpg"], True) is True
+
+
+def test_shared_runner_uses_vst_by_default_without_input():
+    assert device_runner_base.should_use_vst(None, False) is True
+    assert device_runner_base.should_use_vst([], False) is True
+    assert device_runner_base.should_use_vst(["image.jpg"], False) is False
+    assert device_runner_base.should_use_vst(["image.jpg"], True) is True
 
 
 def test_xr_runner_stops_spatial_runner_before_startup(monkeypatch):
@@ -1619,11 +1866,12 @@ def test_xr_runner_device_summary_prints_runtime_modes(monkeypatch, capsys, tmp_
     (detection_dir / "detection_post_det_1.bin").write_bytes(b"\0" * 84)
     monkeypatch.setattr(runner, "collect_relevant_logs", lambda _adb: [])
 
-    runner.print_device_summary(["adb"], output_root)
+    runner.print_device_summary(["adb"], output_root, model_backends=["npu"])
 
     captured = capsys.readouterr()
     assert "Runtime modes: xr" in captured.out
     assert "Pipelines: detection" in captured.out
+    assert "Backend: npu" in captured.out
     assert "Total time: 42 ms" in captured.out
     assert "Submit time:" not in captured.out
     assert "Pipeline time:" not in captured.out
@@ -1681,9 +1929,12 @@ def test_device_runner_summary_prints_asset_references_without_dump_section(monk
     )
     monkeypatch.setattr(device_runner_base, "collect_relevant_logs", lambda _config, _adb: [])
 
-    device_runner_base.print_device_summary(device_runner_base.SPATIAL_CONFIG, ["adb"], output_root)
+    device_runner_base.print_device_summary(
+        device_runner_base.SPATIAL_CONFIG, ["adb"], output_root, model_backends=["gpu"]
+    )
 
     captured = capsys.readouterr()
+    assert "Backend: gpu" in captured.out
     assert "Outputs: 2" in captured.out
     assert "display_frame_pose_1.bin: 64 bytes shape=(4, 4) dtype=float32" in captured.out
     assert "frame_gltf: asset reference gltf/frame.gltf exists=yes" in captured.out
@@ -1782,6 +2033,60 @@ def test_xr_runner_collect_relevant_logs_prioritizes_securemr_and_litert(monkeyp
     assert runner_line in joined
     assert "unrelated" not in joined
     assert "ackReadbackTensorContent" not in joined
+
+
+def test_xr_runner_collect_relevant_logs_keeps_all_securemr_lines(monkeypatch):
+    runner = _load_xr_runner_script()
+    secure_lines = [
+        f"01-01 E {runner.SECUREMR_LOG_TAG_SAMPLE}: failure {index}"
+        for index in range(20)
+    ]
+    secure_readback_line = (
+        f"01-01 E {runner.SECUREMR_LOG_TAG_SAMPLE}: "
+        "ackReadbackTensorContent failed: [INVALID PARAMETER]; no shared memory"
+    )
+
+    class Result:
+        stdout = "\n".join(secure_lines + [secure_readback_line]).encode()
+        stderr = b""
+
+    monkeypatch.setattr(runner.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    logs = runner.collect_relevant_logs(["adb"])
+
+    assert logs == secure_lines + [secure_readback_line]
+    assert secure_lines[0] in logs
+    assert secure_lines[-1] in logs
+
+
+def test_shared_device_runner_collect_relevant_logs_keeps_all_securemr_lines(monkeypatch):
+    secure_lines = [
+        f"01-01 E {device_runner_base.SECUREMR_LOG_TAG_SAMPLE}: failure {index}"
+        for index in range(20)
+    ]
+    secure_readback_line = (
+        f"01-01 E {device_runner_base.SECUREMR_LOG_TAG_SAMPLE}: "
+        "ackReadbackTensorContent failed: [INVALID PARAMETER]; no shared memory"
+    )
+
+    class Result:
+        stdout = "\n".join(secure_lines + [secure_readback_line]).encode()
+        stderr = b""
+
+    monkeypatch.setattr(
+        device_runner_base.subprocess,
+        "run",
+        lambda *_args, **_kwargs: Result(),
+    )
+
+    logs = device_runner_base.collect_relevant_logs(
+        device_runner_base.XR_CONFIG,
+        ["adb"],
+    )
+
+    assert logs == secure_lines + [secure_readback_line]
+    assert secure_lines[0] in logs
+    assert secure_lines[-1] in logs
 
 
 def test_xr_runner_benign_readback_filter_matches_message_variants():

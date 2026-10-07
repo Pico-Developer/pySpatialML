@@ -7,7 +7,7 @@ from .conftest import run_op_test
 
 @trace(inputs=["gltf", "pose"], outputs=["out"])
 def traced_switch_render(gltf, pose):
-    ops.switch_gltf_render_status(gltf, pose=pose, view_locked=False, visible=True)
+    ops.switch_gltf_render_status(gltf, pose=pose)
     dummy = np.array([1], dtype=np.int32)
     return ops.assignment(dummy, np.array([0], dtype=np.int32), output_name="out")
 

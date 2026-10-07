@@ -28,6 +28,14 @@ LITERT_LOG_TAG_SAMPLE = "litert"
 LITERT_IMPORTANT_SAMPLE = "compiler_plugin"
 SECUREMR_LOG_TAG_SAMPLE = "Secure MR::Server"
 BENIGN_READBACK_LOG_TOKENS = ("ackreadbacktensorcontent", "invalid parameter", "no shared memory")
+SPATIAL_LOADER_OPERATOR_ALIASES = {
+    "XR_SECURE_MR_OPERATOR_TYPE_JS_SCRIPTING_PICO":
+        "XR_SECURE_MR_OPERATOR_TYPE_JAVASCRIPT_PICO",
+    "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO":
+        "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
+    "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO":
+        "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
+}
 
 
 @dataclass(frozen=True)
@@ -117,7 +125,9 @@ def main(config: RunnerConfig, argv: list[str] | None = None) -> int:
         package_dir = strip_unused_gltf_outputs(package_dir, tmp_root)
         package_dir = override_model_backend(package_dir, args.backend, tmp_root)
         if config.mode == "spatial":
+            package_dir = normalize_spatial_loader_compatibility(package_dir, tmp_root)
             validate_spatial_runner_scene_ops(package_dir)
+        model_backends = collect_model_backends(package_dir)
         package_zip = make_runner_package_zip(package_dir, tmp_root)
         adb = adb_prefix(args.device)
 
@@ -144,7 +154,7 @@ def main(config: RunnerConfig, argv: list[str] | None = None) -> int:
         setprop(config, adb, "asset_root", "package")
         setprop(config, adb, "output", config.app_output)
         setprop(config, adb, "input", input_remote)
-        setprop(config, adb, "use_vst", "true" if args.use_vst else "false")
+        setprop(config, adb, "use_vst", "true" if should_use_vst(args.input, args.use_vst) else "false")
         setprop(config, adb, "loop", "true" if args.loop else "false")
         setprop(config, adb, "dump_all", "true" if dump_all(args.dump or []) else "false")
         setprop(config, adb, "interval_ms", str(args.interval_ms))
@@ -163,7 +173,7 @@ def main(config: RunnerConfig, argv: list[str] | None = None) -> int:
         try:
             local_outputs = pull_app_outputs(config, adb, output_dir, asset_output_metadata=asset_output_metadata)
             print(f"Pulled outputs to {local_outputs}")
-            print_device_summary(config, adb, local_outputs)
+            print_device_summary(config, adb, local_outputs, model_backends=model_backends)
         finally:
             if args.loop and not args.keep_running:
                 stop_runner_apps(adb)
@@ -185,7 +195,7 @@ def parse_args(config: RunnerConfig, argv: list[str] | None) -> argparse.Namespa
     )
     parser.add_argument("--loop", action="store_true", help="Run the pipeline repeatedly")
     parser.add_argument("--keep-running", action="store_true", help="Leave the runner app running after wait")
-    parser.add_argument("--use-vst", action="store_true", help="Use device VST instead of supplied image/raw input")
+    parser.add_argument("--use-vst", action="store_true", help="Use device VST; this is the default when no --input is supplied")
     parser.add_argument("--backend", choices=["npu", "gpu", "cpu"], help="Override run-model backend in staged package")
     parser.add_argument("--interval-ms", type=int, default=50, help="Loop interval in milliseconds")
     parser.add_argument("--apk", type=Path, help="Runner APK path")
@@ -196,6 +206,11 @@ def parse_args(config: RunnerConfig, argv: list[str] | None) -> argparse.Namespa
 def stop_runner_apps(adb: list[str]) -> None:
     for package_name in (XR_CONFIG.package_name, SPATIAL_CONFIG.package_name):
         run(adb + ["shell", "am", "force-stop", package_name], check=False)
+
+
+def should_use_vst(input_args: list[str] | None, requested: bool) -> bool:
+    """Use device VST unless raw/image input was supplied explicitly."""
+    return requested or not input_args
 
 
 def collect_asset_output_metadata(package_dir: Path) -> list[dict]:
@@ -419,19 +434,107 @@ def override_model_backend(package_dir: Path, backend: str | None, tmp_root: Pat
     return package_dir
 
 
+def normalize_spatial_loader_compatibility(package_dir: Path, tmp_root: Path) -> Path:
+    """Adapt spec-valid operators for the current Spatial SDK loader.
+
+    The package format defines arithmetic as ten positional slots and uses null
+    for unused slots, while the current loader rejects those null entries. The
+    loader accepts compatibility aliases for JavaScript and Spatial scene
+    operators instead of their canonical enum names. The Spatial runner owns
+    this temporary staging copy, so adapt only the staged records. The source
+    package and spec remain unchanged.
+    """
+    package_dir = ensure_mutable_package(package_dir, tmp_root)
+    manifest_path = package_dir / "manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as file:
+        manifest = json.load(file)
+    pipelines = manifest.get("pipelines")
+    if not isinstance(pipelines, list):
+        return package_dir
+
+    changed = 0
+    for item in pipelines:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        pipeline_path = safe_package_path(package_dir, str(item["path"]))
+        if pipeline_path is None or not pipeline_path.is_file():
+            continue
+        with open(pipeline_path, "r", encoding="utf-8") as file:
+            spec = json.load(file)
+        operators = spec.get("operators")
+        if not isinstance(operators, list):
+            continue
+        pipeline_changed = False
+        for index, op in enumerate(operators):
+            if not isinstance(op, dict):
+                continue
+            compatibility_type = SPATIAL_LOADER_OPERATOR_ALIASES.get(op.get("type"))
+            if compatibility_type is not None:
+                op["type"] = compatibility_type
+                pipeline_changed = True
+                changed += 1
+            op_type = str(op.get("type") or "").upper()
+            if not op_type.endswith("ARITHMETIC_COMPOSE_PICO"):
+                continue
+            inputs = op.get("inputs")
+            if not isinstance(inputs, list) or not any(value is None for value in inputs):
+                continue
+            connected = [slot for slot in inputs if slot is not None]
+            if not connected:
+                raise RuntimeError(
+                    f"Spatial staging cannot compact arithmetic operator #{index}: no connected inputs"
+                )
+            old_to_new = {}
+            new_index = 0
+            for old_index, slot in enumerate(inputs):
+                if slot is not None:
+                    old_to_new[old_index] = new_index
+                    new_index += 1
+
+            attrs = op.get("attrs")
+            if not isinstance(attrs, list) or not attrs or not isinstance(attrs[0], str):
+                raise RuntimeError(
+                    f"Spatial staging cannot compact arithmetic operator #{index}: missing expression"
+                )
+            expression = attrs[0]
+
+            def remap_reference(match: re.Match[str]) -> str:
+                old_index = int(match.group(1))
+                if old_index not in old_to_new:
+                    raise RuntimeError(
+                        f"Spatial staging cannot compact arithmetic operator #{index}: "
+                        f"expression references null input slot {old_index}"
+                    )
+                return "{" + str(old_to_new[old_index]) + "}"
+
+            remapped_expression = re.sub(r"\{(\d+)\}", remap_reference, expression)
+            op["inputs"] = connected
+            attrs[0] = remapped_expression
+            pipeline_changed = True
+            changed += 1
+
+        if pipeline_changed:
+            with open(pipeline_path, "w", encoding="utf-8") as file:
+                json.dump(spec, file, indent=2)
+                file.write("\n")
+
+    if changed:
+        print(f"Normalized {changed} Spatial operator record(s) for runner staging.")
+    return package_dir
+
+
 def normalize_operator_type(op_type: str) -> str:
-    normalized = op_type.strip().lower()
-    if normalized in {
-        "scenegraph_visibility",
-        "xr_secure_mr_operator_type_scenegraph_visibility_pico",
+    if op_type in {
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_SWITCH_VISIBILITY_PICO",
+        "XR_SECURE_MR_OPERATOR_TYPE_SCENEGRAPH_VISIBILITY_PICO",
     }:
-        return "scenegraph_visibility"
-    if normalized in {
-        "update_component",
-        "xr_secure_mr_operator_type_update_component_pico",
+        return "ssmr_switch_visibility"
+    if op_type in {
+        "XR_SECURE_MR_OPERATOR_TYPE_SSMR_UPDATE_COMPONENT_PICO",
+        "XR_SECURE_MR_OPERATOR_TYPE_UPDATE_COMPONENT_PICO",
     }:
-        return "update_component"
-    return normalized
+        return "ssmr_update_component"
+    return ""
 
 
 def validate_spatial_runner_scene_ops(package_dir: Path) -> None:
@@ -454,16 +557,17 @@ def validate_spatial_runner_scene_ops(package_dir: Path) -> None:
         for index, op in enumerate(spec.get("operators", [])):
             if not isinstance(op, dict):
                 continue
-            if normalize_operator_type(str(op.get("type") or "")) != "update_component":
+            if normalize_operator_type(str(op.get("type") or "")) != "ssmr_update_component":
                 continue
-            scenegraph = op.get("scenegraph") or (op.get("inputs") or [None])[0]
-            data = op.get("data") or (op.get("inputs") or [None, None])[1]
-            entity_path = op.get("entity_path") or op.get("entityPath")
-            property_name = op.get("property") or op.get("target_property")
-            if not scenegraph or not data or not entity_path or not property_name:
+            inputs = op.get("inputs")
+            attrs = op.get("attrs")
+            if (not isinstance(inputs, list) or len(inputs) != 2 or
+                    not isinstance(inputs[0], dict) or not isinstance(inputs[1], dict) or
+                    not isinstance(attrs, list) or len(attrs) != 1 or
+                    not isinstance(attrs[0], str) or not attrs[0].startswith("/") or ":" not in attrs[0]):
                 raise SystemExit(
-                    f"Invalid update_component at {pipeline_id}[{index}]: requires "
-                    "scenegraph, data, entity_path, and property"
+                    f"Invalid SSMR_UPDATE_COMPONENT at {pipeline_id}[{index}]: requires "
+                    "two tensor inputs and component path in attrs[0]"
                 )
 
 
@@ -475,17 +579,48 @@ def override_pipeline_model_backend(spec: dict, backend: str) -> int:
     for op in operators:
         if not isinstance(op, dict) or not is_model_operator(op):
             continue
-        op["model_target"] = backend
         model = op.get("model")
         if isinstance(model, dict):
             model["model_target"] = backend
-        changed += 1
+            changed += 1
     return changed
 
 
 def is_model_operator(op: dict) -> bool:
-    op_type = str(op.get("type") or op.get("operator_type") or "").lower()
-    return "run_model_inference" in op_type or "run_algorithm" in op_type
+    return op.get("type") == "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO"
+
+
+def collect_model_backends(package_dir: Path) -> list[str]:
+    """Read effective model targets from the finalized staged package."""
+    try:
+        manifest = json.loads((package_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    pipelines = manifest.get("pipelines")
+    if not isinstance(pipelines, list):
+        return []
+
+    backends = []
+    for item in pipelines:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        pipeline_path = safe_package_path(package_dir, str(item["path"]))
+        if pipeline_path is None or not pipeline_path.is_file():
+            continue
+        try:
+            spec = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for op in spec.get("operators", []):
+            if not isinstance(op, dict) or not is_model_operator(op):
+                continue
+            model = op.get("model")
+            if not isinstance(model, dict):
+                continue
+            backend = str(model.get("model_target") or "npu").strip().lower()
+            if backend and backend not in backends:
+                backends.append(backend)
+    return backends
 
 
 def ensure_mutable_package(package_dir: Path, tmp_root: Path) -> Path:
@@ -811,7 +946,13 @@ def pull_remote_status(config: RunnerConfig, adb: list[str], files: list[str]) -
     return {}
 
 
-def print_device_summary(config: RunnerConfig, adb: list[str], local_outputs: Path) -> None:
+def print_device_summary(
+    config: RunnerConfig,
+    adb: list[str],
+    local_outputs: Path,
+    *,
+    model_backends: list[str] | None = None,
+) -> None:
     status_path = local_outputs / "status.json"
     status = {}
     if status_path.is_file():
@@ -834,6 +975,7 @@ def print_device_summary(config: RunnerConfig, adb: list[str], local_outputs: Pa
         print(f"  Runtime modes: {runtime_modes}")
         pipelines = ", ".join(str(item) for item in status.get("pipelines", [])) or "-"
         print(f"  Pipelines: {pipelines}")
+        print(f"  Backend: {', '.join(model_backends or []) or '-'}")
         print(f"  Iteration: {status.get('iteration', '-')}")
         print(f"  Total time: {format_ms(status.get('total_elapsed_ms'))}")
         print(f"  Loop: {str(status.get('loop', '-')).lower()}")
@@ -1081,24 +1223,29 @@ def collect_relevant_logs(config: RunnerConfig, adb: list[str]) -> list[str]:
         r"(\s[VDIWEF]\s+(litert|tflite)\s*:|LiteRT|LiteRt|TFLite|tflite|"
         r"compiler_plugin|libLiteRtCompilerPlugin|LiteRtDispatch)"
     )
-    securemr_pattern = re.compile(rf"({re.escape(SECUREMR_LOG_TAG_SAMPLE)}|OperatorRunModelInference)")
+    securemr_pattern = re.compile(re.escape(SECUREMR_LOG_TAG_SAMPLE))
     runner_pattern = re.compile(rf"({re.escape(config.log_sample)}|OpenMR:|SpatialML)")
     litert_lines = []
     securemr_lines = []
     runner_lines = []
     output = result.stdout.decode("utf-8", errors="replace")
     for line in output.splitlines():
+        # SecureMR owns the authoritative pipeline and inference errors. Keep
+        # every line from that tag, including messages that would otherwise
+        # match the benign readback filter, so early failures are not hidden
+        # by later teardown or rendering logs.
+        if securemr_pattern.search(line):
+            securemr_lines.append(line)
+            continue
         if is_benign_readback_log(line):
             continue
         if litert_pattern.search(line):
             litert_lines.append(line)
-        elif securemr_pattern.search(line):
-            securemr_lines.append(line)
         elif runner_pattern.search(line):
             runner_lines.append(line)
     return (
         select_litert_logs(litert_lines, 24)
-        + tail_unique(securemr_lines, 16)
+        + securemr_lines
         + tail_unique(runner_lines, 12)
     )
 

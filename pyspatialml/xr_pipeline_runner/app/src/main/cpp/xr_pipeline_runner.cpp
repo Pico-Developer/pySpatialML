@@ -38,6 +38,7 @@ namespace {
 
 constexpr int kDefaultCameraWidth = 580;
 constexpr int kDefaultCameraHeight = 326;
+constexpr auto kOneShotReadbackDelay = std::chrono::milliseconds(250);
 constexpr const char* kDefaultPackageRoot =
     "/sdcard/Android/data/com.bytedance.pico.pyspatialml.xr_runner/files/package";
 constexpr const char* kDefaultOutputDir =
@@ -52,6 +53,18 @@ std::string GetProp(const char* key, const std::string& fallback = "") {
   }
   std::string result(value, static_cast<size_t>(length));
   return result == kEmptyPropertyValue ? std::string{} : result;
+}
+
+std::string JsonEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (const char character : value) {
+    if (character == '\\' || character == '"') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(character);
+  }
+  return escaped;
 }
 
 bool GetBoolProp(const char* key, bool fallback = false) {
@@ -350,6 +363,7 @@ class XrPipelineRunnerProgram final : public ISecureMR {
         Log::Write(Log::Level::Error,
                    Fmt("pySpatialML XR runner: package load failed from %s: %s", packageRoot.string().c_str(),
                        loadError.c_str()));
+        WriteStatus(-1, "error", loadError);
         FinishInit(false);
         return;
       }
@@ -367,8 +381,8 @@ class XrPipelineRunnerProgram final : public ISecureMR {
           pipelineOrder_.push_back(id);
         }
       }
-
       if (!BindInputs()) {
+        WriteStatus(-1, "error", "failed to bind image/raw inputs");
         FinishInit(false);
         return;
       }
@@ -401,13 +415,25 @@ class XrPipelineRunnerProgram final : public ISecureMR {
             keepRunning_ = false;
             break;
           }
-          previousRun = it->second.pipeline->submit(it->second.submitBindings, previousRun, nullptr);
+          try {
+            previousRun = it->second.pipeline->submit(it->second.submitBindings, previousRun, nullptr);
+          } catch (const std::exception& error) {
+            Log::Write(Log::Level::Error,
+                       Fmt("pySpatialML XR runner: pipeline '%s' submission failed: %s", pipelineId.c_str(),
+                           error.what()));
+            WriteStatus(-1, "error", error.what());
+            keepRunning_ = false;
+            return;
+          }
         }
         ++iteration_;
         WriteStatus(-1, loop_ ? "running" : "submitted");
         Log::Write(Log::Level::Info, Fmt("pySpatialML XR runner: iteration %d submitted", iteration_.load()));
         if (!loop_) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(40));
+          // Pipeline submission is asynchronous. Give the final submitted run
+          // enough time to publish its global outputs before the first one-shot
+          // readback request snapshots them.
+          std::this_thread::sleep_for(kOneShotReadbackDelay);
           StartPreparedReadback();
         }
         if (loop_ && keepRunning_) {
@@ -490,7 +516,24 @@ class XrPipelineRunnerProgram final : public ISecureMR {
 
     std::unordered_map<std::string, std::vector<uint8_t>> inputDataCache;
     for (auto& [pipelineId, package] : bundle_.pipelines) {
-      for (const auto& inputName : package.inputs) {
+      std::vector<std::string> inputNames = package.inputs;
+      if (inputNames.empty()) {
+        const std::set<std::string> outputNames(package.outputs.begin(), package.outputs.end());
+        for (const auto& [tensorName, pipelineTensor] : package.tensorMap) {
+          if (pipelineTensor == nullptr || outputNames.find(tensorName) != outputNames.end()) {
+            continue;
+          }
+          const auto attrVariant = pipelineTensor->getAttribute();
+          const auto* attr = std::get_if<TensorAttribute>(&attrVariant);
+          if (attr == nullptr || !IsImageModeExternalTensor(tensorName, *attr) ||
+              package.globalTensorMap.find(tensorName) == package.globalTensorMap.end()) {
+            continue;
+          }
+          inputNames.push_back(tensorName);
+        }
+      }
+
+      for (const auto& inputName : inputNames) {
         const auto globalIt = package.globalTensorMap.find(inputName);
         if (globalIt == package.globalTensorMap.end()) {
           Log::Write(Log::Level::Warning,
@@ -508,10 +551,17 @@ class XrPipelineRunnerProgram final : public ISecureMR {
           continue;
         }
 
-        std::filesystem::path path = ResolveInputPath(inputPath_, inputName);
-
         std::vector<uint8_t> data;
-        if (!path.empty() && IsImagePath(path)) {
+        std::filesystem::path path;
+        if (IsDefaultableTensorName(inputName, *attr)) {
+          data = DefaultTensorData(inputName, *attr);
+          path = "<default>";
+        } else {
+          path = ResolveInputPath(inputPath_, inputName);
+        }
+        if (!data.empty()) {
+          // The default tensor was populated above.
+        } else if (!path.empty() && IsImagePath(path)) {
           if (!IsImageTensor(*attr)) {
             continue;
           }
@@ -551,9 +601,6 @@ class XrPipelineRunnerProgram final : public ISecureMR {
             data = ConvertImageToTensor(path, *attr);
             inputDataCache.emplace(cacheKey, data);
           }
-        } else if (IsDefaultableTensorName(inputName, *attr)) {
-          data = DefaultTensorData(inputName, *attr);
-          path = "<default>";
         } else {
           continue;
         }
@@ -708,7 +755,7 @@ class XrPipelineRunnerProgram final : public ISecureMR {
     return std::max<long long>(SteadyNowMs() - startMs, 0);
   }
 
-  void WriteStatus(long long totalElapsedMs, const char* state) const {
+  void WriteStatus(long long totalElapsedMs, const char* state, const std::string& error = {}) const {
     std::filesystem::create_directories(outputDir_);
     std::ofstream status(std::filesystem::path(outputDir_) / "status.json", std::ios::trunc);
     if (!status) {
@@ -717,6 +764,13 @@ class XrPipelineRunnerProgram final : public ISecureMR {
     status << "{\n";
     status << "  \"iteration\": " << iteration_.load() << ",\n";
     status << "  \"state\": \"" << state << "\",\n";
+    status << "  \"error\": ";
+    if (error.empty()) {
+      status << "null";
+    } else {
+      status << "\"" << JsonEscape(error) << "\"";
+    }
+    status << ",\n";
     status << "  \"total_elapsed_ms\": ";
     if (totalElapsedMs >= 0) {
       status << totalElapsedMs;

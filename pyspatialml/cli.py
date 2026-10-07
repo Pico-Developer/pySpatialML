@@ -40,6 +40,14 @@ from pyspatialml.litert_tools import (
     repair_litert_cli,
     resolve_litert_cli,
 )
+from securemr.operator_contracts import (
+    OperatorInputError,
+    all_input_switches,
+    all_output_switches,
+    order_named_inputs,
+    order_named_outputs,
+    split_named_bindings,
+)
 
 
 class CliError(RuntimeError):
@@ -48,6 +56,15 @@ class CliError(RuntimeError):
 
 class RunTargetCliError(RuntimeError):
     """Raised for lightweight run target validation failures before run dispatch."""
+
+
+class _StoreOperatorBinding(argparse.Action):
+    """Collect an operator tensor together with the switch that named it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        bindings = list(getattr(namespace, self.dest, None) or [])
+        bindings.append((str(option_string)[2:], values))
+        setattr(namespace, self.dest, bindings)
 
 
 _DOMAIN_MODULES = {
@@ -211,6 +228,7 @@ def _add_pipeline_parser(subparsers: argparse._SubParsersAction) -> None:
     add_tensor.add_argument("--shape", required=True, help="Tensor shape, for example 128,128,3.")
     add_tensor.add_argument("--dtype", required=True, help="Tensor dtype, for example uint8 or float32.")
     add_tensor.add_argument("--usage", default="matrix", help="Tensor usage: matrix, scalar, point, slice, color, timestamp, gltf.")
+    add_tensor.add_argument("--channels", type=int, help="Explicit channel count; keeps --shape as spatial dimensions.")
     add_tensor.add_argument("--input", action="store_true", help="Also mark this tensor as a pipeline input.")
     add_tensor.add_argument("--output", action="store_true", help="Also mark this tensor as a pipeline output.")
     add_tensor.add_argument("--value", help="Optional comma-separated tensor values.")
@@ -225,33 +243,54 @@ def _add_pipeline_parser(subparsers: argparse._SubParsersAction) -> None:
     _add_json_output_argument(remove_tensor)
     remove_tensor.set_defaults(func=_run_pipeline_remove_tensor)
 
-    add_op = pipeline_subparsers.add_parser("add-op", help="Append an operator.")
+    add_op = pipeline_subparsers.add_parser(
+        "add-op", help="Append an operator.", allow_abbrev=False
+    )
     add_op.add_argument("pipeline", type=Path, help="Pipeline JSON path.")
-    add_op.add_argument("op_type", help="Operator type or alias, for example assignment or arithmetic.")
-    add_op.add_argument("--input", action="append", default=[], help="Input tensor name. Repeatable.")
-    add_op.add_argument("--output", action="append", default=[], help="Output tensor name. Repeatable.")
+    add_op.add_argument("op_type", help="Canonical XR_SECURE_MR_OPERATOR_TYPE_*_PICO operator name.")
+    for switch in sorted(set(all_input_switches()) | set(all_output_switches())):
+        add_op.add_argument(
+            switch,
+            dest="operator_bindings",
+            action=_StoreOperatorBinding,
+            metavar="TENSOR",
+            help="Named operator input or result tensor. Availability depends on OP_TYPE.",
+        )
+    add_op.add_argument(
+        "--named-input",
+        action="append",
+        default=[],
+        metavar="NAME=TENSOR",
+        help="Dynamic model or JavaScript input binding. Repeatable.",
+    )
+    add_op.add_argument(
+        "--named-output",
+        action="append",
+        default=[],
+        metavar="NAME=TENSOR",
+        help="Dynamic model or JavaScript result binding. Repeatable.",
+    )
     add_op.add_argument("--attr", action="append", default=[], help="Raw operator attr. Repeatable.")
     add_op.add_argument("--expression", help="Arithmetic expression for arithmetic operators.")
     add_op.add_argument("--dtype", help="Operator dtype hint when supported.")
-    add_op.add_argument("--flag", help="Integer flag for operators such as convert_color.")
+    add_op.add_argument("--flag", help="Integer flag for operators such as cvt_color.")
     add_op.add_argument("--threshold", type=float, help="Threshold for operators such as nms.")
-    add_op.add_argument("--model", help="Package-relative .tflite model path for model inference operators.")
+    add_op.add_argument("--comparison", help="Comparison operator for customized_compare.")
+    add_op.add_argument("--script", help="JavaScript source for javascript operators.")
+    add_op.add_argument("--config", help="Text render config for render_text.")
+    add_op.add_argument("--update-type", help="Update command for update_gltf.")
+    add_op.add_argument("--mode", help="Sort orientation for sort_mat.")
+    add_op.add_argument("--model", help="Package-relative .tflite model path for run_algorithm.")
     add_op.add_argument("--model-name", help="Logical model name.")
     add_op.add_argument("--model-target", default="npu", help="Model target, defaults to npu.")
     add_op.add_argument("--cpu-target-num-threads", type=int, default=1, help="CPU thread count for CPU target.")
-    add_op.add_argument("--scenegraph", help="Scenegraph tensor for scene operations.")
     add_op.add_argument("--entity-path", help="Entity path for update_component, starting with '/'.")
     add_op.add_argument("--property", dest="property", help="SceneGraphProperty name for update_component.")
-    add_op.add_argument("--target-property", dest="property", help=argparse.SUPPRESS)
-    add_op.add_argument("--data", help="Data tensor for update_component.")
+    add_op.add_argument("--target-property", dest="target_property", help=argparse.SUPPRESS)
     add_op.add_argument("--src-slices", help="JSON or semicolon/comma slice array for assignment.")
     add_op.add_argument("--dst-slices", help="JSON or semicolon/comma slice array for assignment.")
-    add_op.add_argument("--src-slices-tensor", help="Tensor containing source slice descriptors.")
-    add_op.add_argument("--dst-slices-tensor", help="Tensor containing destination slice descriptors.")
     add_op.add_argument("--src-channel-slice", help="JSON or comma-separated source channel slice.")
     add_op.add_argument("--dst-channel-slice", help="JSON or comma-separated destination channel slice.")
-    add_op.add_argument("--src-points", help="JSON or semicolon/comma source points for get_affine.")
-    add_op.add_argument("--dst-points", help="JSON or semicolon/comma destination points for get_affine.")
     _add_json_output_argument(add_op)
     add_op.set_defaults(func=_run_pipeline_add_op)
 
@@ -388,7 +427,18 @@ def _add_json_output_argument(parser: argparse.ArgumentParser, *, help: str = "P
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run pySpatialML CLI."""
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        if getattr(args, "command", None) == "pipeline" and getattr(args, "pipeline_command", None) == "add-op":
+            try:
+                args.operator_bindings = [
+                    *(getattr(args, "operator_bindings", None) or []),
+                    *_parse_dynamic_operator_inputs(unknown),
+                ]
+            except CliError as exc:
+                parser.error(str(exc))
+        else:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     if getattr(args, "output_format", None) == "json":
         args.json = True
     try:
@@ -853,6 +903,7 @@ def _run_pipeline_add_tensor(args: argparse.Namespace) -> int:
             shape=args.shape,
             dtype=args.dtype,
             usage=args.usage,
+            channels=args.channels,
             is_input=args.input,
             is_output=args.output,
             value=args.value,
@@ -864,6 +915,7 @@ def _run_pipeline_add_tensor(args: argparse.Namespace) -> int:
             "shape": args.shape,
             "dtype": args.dtype,
             "usage": args.usage,
+            "channels": args.channels,
             "input": args.input,
             "output": args.output,
         },
@@ -882,43 +934,80 @@ def _run_pipeline_remove_tensor(args: argparse.Namespace) -> int:
 
 def _run_pipeline_add_op(args: argparse.Namespace) -> int:
     pipeline_cli = _domain_module("pipeline_cli")
+    try:
+        input_bindings, output_bindings = split_named_bindings(
+            args.op_type, getattr(args, "operator_bindings", None) or []
+        )
+        inputs = order_named_inputs(
+            args.op_type,
+            input_bindings,
+            args.named_input,
+        )
+        outputs = order_named_outputs(args.op_type, output_bindings, args.named_output)
+    except OperatorInputError as exc:
+        raise CliError(str(exc)) from exc
     return _json_action(
         args,
         "pipeline.add_op",
         lambda: pipeline_cli.add_op(
             args.pipeline,
             args.op_type,
-            inputs=args.input,
-            outputs=args.output,
+            inputs=inputs,
+            outputs=outputs,
             attrs=args.attr,
             expression=args.expression,
             dtype=args.dtype,
             flag=args.flag,
             threshold=args.threshold,
+            comparison=args.comparison,
+            script=args.script,
+            config=args.config,
+            text=None,
+            update_type=args.update_type,
+            mode=args.mode,
             model=args.model,
             model_name=args.model_name,
             model_target=args.model_target,
             cpu_target_num_threads=args.cpu_target_num_threads,
-            scenegraph=args.scenegraph,
+            scenegraph=None,
             entity_path=args.entity_path,
             property=args.property,
-            data=args.data,
+            target_property=args.target_property,
+            data=None,
             src_slices=args.src_slices,
             dst_slices=args.dst_slices,
-            src_slices_tensor=args.src_slices_tensor,
-            dst_slices_tensor=args.dst_slices_tensor,
             src_channel_slice=args.src_channel_slice,
             dst_channel_slice=args.dst_channel_slice,
-            src_points=args.src_points,
-            dst_points=args.dst_points,
         ),
         {
             "pipeline": str(args.pipeline),
             "op_type": args.op_type,
-            "inputs": args.input,
-            "outputs": args.output,
+            "inputs": inputs,
+            "outputs": outputs,
         },
     )
+
+
+def _parse_dynamic_operator_inputs(tokens: Sequence[str]) -> list[tuple[str, str]]:
+    """Parse otherwise unknown ``--operand-name TENSOR`` pairs for dynamic ops."""
+    values: list[tuple[str, str]] = []
+    index = 0
+    while index < len(tokens):
+        switch = tokens[index]
+        if not switch.startswith("--") or switch == "--":
+            raise CliError(f"Unexpected add-op argument: {switch}")
+        if "=" in switch:
+            name, value = switch[2:].split("=", 1)
+            if not name or not value:
+                raise CliError(f"{switch} must use --NAME=TENSOR format")
+            values.append((name, value))
+            index += 1
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+            raise CliError(f"{switch} requires a tensor name")
+        values.append((switch[2:], tokens[index + 1]))
+        index += 2
+    return values
 
 
 def _run_pipeline_remove_op(args: argparse.Namespace) -> int:

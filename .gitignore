@@ -40,6 +40,8 @@ build/
 **/*.hbir
 **/*.dot
 **/*.json
+!examples/all_xr_operators_pipeline.json
+!examples/all_spatial_operators_pipeline.json
 **/*.log
 **/*.tar
 **/*.tar.gz

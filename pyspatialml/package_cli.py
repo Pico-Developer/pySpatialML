@@ -32,7 +32,13 @@ from securemr.pipeline_zoo import (
     PipelineZooPackageSpec,
     load_pipeline_zoo_manifest,
 )
-from securemr.py2smr.verifier import validate_pipeline_spec
+from securemr.py2smr.verifier import validate_microphone_attrs, validate_pipeline_spec
+from securemr.operator_contracts import (
+    SPATIAL_ONLY_OPERATORS,
+    XR_ONLY_OPERATORS,
+    operator_contract,
+    package_operator_name,
+)
 from pyspatialml.zip_utils import ZipSafetyError, safe_extract_zip
 
 
@@ -66,24 +72,28 @@ _GLTF_KEYS = {
     "scene",
     "scene_path",
 }
-_XR_ONLY_OPERATORS = {
-    "LOAD_TEXTURE",
-    "RENDER_TEXT",
-    "SWITCH_GLTF_RENDER_STATUS",
-    "UPDATE_GLTF",
+_XR_ONLY_OPERATORS = XR_ONLY_OPERATORS
+_SPATIAL_ONLY_OPERATORS = SPATIAL_ONLY_OPERATORS
+_LEGACY_OPERATOR_FIELDS = {
+    "comparison",
+    "config",
+    "flag",
+    "mode",
+    "model_asset",
+    "model_file",
+    "model_id",
+    "model_name",
+    "model_target",
+    "model_type",
+    "cpu_target_num_threads",
+    "normalize_type",
+    "script",
+    "target_property",
+    "text",
+    "threshold",
+    "update_type",
+    "visible",
 }
-_SPATIAL_ONLY_OPERATORS = {
-    "SCENEGRAPH_VISIBILITY",
-    "UPDATE_COMPONENT",
-}
-_CUSTOM_HANDLER_ONLY_OPERATORS = {
-    "CAMERA_SPACE_TO_WORLD",
-    "LOAD_TEXTURE",
-    "SWITCH_GLTF_RENDER_STATUS",
-    "UPDATE_GLTF",
-    "RENDER_TEXT",
-}
-
 
 def create_package(
     *,
@@ -143,7 +153,6 @@ def create_package(
         if not source_pipeline.is_file():
             raise PackageCliError(f"Pipeline file not found: {source_pipeline}")
         pipeline_spec = _read_json(source_pipeline)
-        validate_pipeline_spec(pipeline_spec)
 
         package_pipeline_path = f"pipeline/{item.id}.json"
         normalized_spec = _normalize_pipeline_assets(
@@ -152,19 +161,22 @@ def create_package(
             asset_roots=asset_roots,
             copied_assets=copied_assets,
         )
+        _reject_legacy_operator_fields(normalized_spec, pipeline_id=item.id)
+        _validate_canonical_operator_specs(normalized_spec, pipeline_id=item.id)
+        _validate_with_verifier(normalized_spec)
         _write_json(package_root / package_pipeline_path, normalized_spec)
         manifest_entries.append(PipelinePackageEntry(item.id, package_pipeline_path))
         packaged_pipeline_specs.append((item.id, normalized_spec))
 
+    inferred_modes = _infer_pipeline_modes(packaged_pipeline_specs)
+    effective_modes = supported_modes or inferred_modes
     package = PipelineZooPackageSpec(
         package_id=package_id,
-        supported_modes=supported_modes,
+        supported_modes=effective_modes,
         pipelines=manifest_entries,
     )
     manifest = package.to_manifest_dict()
-    inferred_modes = _validate_pipeline_modes(manifest, packaged_pipeline_specs)
-    if not supported_modes:
-        manifest.setdefault("runtime", {})["supported_modes"] = inferred_modes
+    _validate_pipeline_modes(manifest, packaged_pipeline_specs)
     _write_json(package_root / "manifest.json", manifest)
 
     for package_path, source_path in copied_assets.items():
@@ -328,12 +340,14 @@ def _collect_package_pipeline_specs(
         if not pipeline_path.is_file():
             raise PackageCliError(f"Manifest references missing pipeline: {pipeline['path']}")
         spec = _read_json(pipeline_path)
-        validate_pipeline_spec(spec)
-        pipeline_specs.append((str(pipeline["id"]), spec))
+        _reject_legacy_operator_fields(spec, pipeline_id=str(pipeline["id"]))
+        _validate_canonical_operator_specs(spec, pipeline_id=str(pipeline["id"]))
         for asset in _iter_pipeline_asset_refs(spec):
             asset_path = _resolve_package_file(root, asset, label="asset")
             if not asset_path.is_file():
                 raise PackageCliError(f"Pipeline references missing package asset: {asset}")
+        _validate_with_verifier(spec)
+        pipeline_specs.append((str(pipeline["id"]), spec))
 
 
 def _reconcile_manifest_modes(root: Path, manifest: dict[str, Any]) -> None:
@@ -382,9 +396,6 @@ def _package_runtime_requirements(root: Path, manifest: Mapping[str, Any]) -> li
     for _, spec in pipeline_specs:
         if _has_gltf_asset_tensor(spec):
             requirements.add("GLTF tensor asset materialization in the downstream runtime")
-        for op_type in _pipeline_operator_type_names(spec):
-            if op_type in _CUSTOM_HANDLER_ONLY_OPERATORS:
-                requirements.add(f"downstream custom operator handler for {op_type.lower()}")
     return sorted(requirements)
 
 
@@ -394,7 +405,11 @@ def _has_gltf_asset_tensor(spec: Mapping[str, Any]) -> bool:
         return False
     return any(
         isinstance(tensor, Mapping)
-        and str(tensor.get("tensor_type") or tensor.get("type") or "").lower() == "gltf"
+        and (
+            tensor.get("is_gltf") is True
+            or int(tensor.get("usage") or 0) == 7
+            or str(tensor.get("type") or "").lower() == "gltf"
+        )
         and isinstance(tensor.get("asset"), str)
         and bool(tensor.get("asset"))
         for tensor in tensors.values()
@@ -430,8 +445,8 @@ def _parse_pipeline_arg(value: str) -> PipelineInput:
     pipeline_id = pipeline_id.strip()
     if not pipeline_id:
         raise PackageCliError("Pipeline id cannot be empty")
-    _normalize_package_path(pipeline_id)
-    return PipelineInput(id=pipeline_id, source=Path(source))
+    normalized_id = _normalize_package_path(pipeline_id)
+    return PipelineInput(id=normalized_id, source=Path(source))
 
 
 def _normalize_pipeline_assets(
@@ -458,17 +473,16 @@ def _normalize_pipeline_assets(
                     copied_assets=copied_assets,
                 )
                 model["bin_path"] = package_path
-                # Current XR deserializers still read these fields at operator
-                # level even though model metadata is also nested under model.
                 model.setdefault("model_type", "tflite")
-                model.setdefault("model_target", op.get("model_target", "npu"))
-                model.setdefault("cpu_target_num_threads", op.get("cpu_target_num_threads", 1))
-                for key in ("model_name", "model_type", "model_target", "cpu_target_num_threads"):
-                    if key in model:
-                        op[key] = model[key]
-                op.pop("model_file", None)
-                op.pop("model_asset", None)
-                op.pop("model_id", None)
+                model.setdefault("model_target", "npu")
+                if model.get("model_target") == "cpu":
+                    model.setdefault("cpu_target_num_threads", 1)
+        legacy_fields = sorted(key for key in op if key in _LEGACY_OPERATOR_FIELDS)
+        if legacy_fields:
+            raise PackageCliError(
+                "Pipeline operator uses legacy package field(s): "
+                f"{', '.join(legacy_fields)}. Use attrs and inline model metadata instead."
+            )
         for key in list(op.keys()):
             if key.lower() in _GLTF_KEYS and isinstance(op[key], str):
                 op[key] = _register_asset(
@@ -485,7 +499,7 @@ def _normalize_pipeline_assets(
         for tensor in tensors.values():
             if not isinstance(tensor, dict):
                 continue
-            if str(tensor.get("tensor_type") or tensor.get("type") or "").lower() == "gltf" and tensor.get("asset"):
+            if _is_gltf_tensor(tensor) and tensor.get("asset"):
                 tensor["asset"] = _register_asset(
                     str(tensor["asset"]),
                     target_dir="gltf",
@@ -562,8 +576,19 @@ def _iter_pipeline_asset_refs(spec: Mapping[str, Any]) -> Iterable[str]:
         for tensor in tensors.values():
             if not isinstance(tensor, Mapping):
                 continue
-            if str(tensor.get("tensor_type") or tensor.get("type") or "").lower() == "gltf" and tensor.get("asset"):
+            if _is_gltf_tensor(tensor) and tensor.get("asset"):
                 yield _normalize_package_path(str(tensor["asset"]))
+
+
+def _is_gltf_tensor(tensor: Mapping[str, Any]) -> bool:
+    if tensor.get("is_gltf") is True:
+        return True
+    try:
+        if int(tensor.get("usage") or 0) == 7:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(tensor.get("type") or "").lower() == "gltf"
 
 
 def _validate_pipeline_modes(
@@ -644,18 +669,123 @@ def _pipeline_operator_type_names(spec: Mapping[str, Any]) -> Iterable[str]:
     for op in spec.get("operators", []):
         if not isinstance(op, Mapping):
             continue
-        op_type = _normalize_operator_type_name(str(op.get("type") or op.get("operator_type") or ""))
+        op_type = _normalize_operator_type_name(str(op.get("type") or ""))
         if op_type:
             yield op_type
 
 
 def _normalize_operator_type_name(value: str) -> str:
-    normalized = value.strip().upper()
-    if normalized.startswith("XR_SECURE_MR_OPERATOR_TYPE_"):
-        normalized = normalized[len("XR_SECURE_MR_OPERATOR_TYPE_") :]
-    if normalized.endswith("_PICO"):
-        normalized = normalized[: -len("_PICO")]
-    return normalized
+    return package_operator_name(value)
+
+
+def _validate_with_verifier(spec: Mapping[str, Any]) -> None:
+    try:
+        validate_pipeline_spec(dict(spec))
+    except ValueError as exc:
+        raise PackageCliError(str(exc)) from exc
+
+
+def _reject_legacy_operator_fields(spec: Mapping[str, Any], *, pipeline_id: str) -> None:
+    for index, op in enumerate(spec.get("operators", [])):
+        if not isinstance(op, Mapping):
+            continue
+        legacy_fields = sorted(key for key in op if key in _LEGACY_OPERATOR_FIELDS)
+        if legacy_fields:
+            raise PackageCliError(
+                f"Pipeline {pipeline_id} operator #{index} uses legacy package field(s): "
+                f"{', '.join(legacy_fields)}. Use attrs and inline model metadata instead."
+            )
+
+
+def _validate_canonical_operator_specs(spec: Mapping[str, Any], *, pipeline_id: str) -> None:
+    for index, op in enumerate(spec.get("operators", [])):
+        if not isinstance(op, Mapping):
+            continue
+        op_name = _normalize_operator_type_name(str(op.get("type") or ""))
+        contract = operator_contract(op_name)
+        if contract is None:
+            continue
+        arity = contract.serialized_arity
+        attrs = op.get("attrs", [])
+        if attrs is None:
+            attrs = []
+        if not isinstance(attrs, list) or not all(isinstance(item, str) for item in attrs):
+            raise PackageCliError(f"Pipeline {pipeline_id} operator #{index} attrs must be an array of strings")
+        _validate_attr_count(pipeline_id, index, op_name, attrs)
+        min_inputs, max_inputs, min_outputs, max_outputs, nullable_inputs, nullable_outputs = arity
+        inputs = op.get("inputs", [])
+        outputs = op.get("outputs", [])
+        if not isinstance(inputs, list) or not isinstance(outputs, list):
+            raise PackageCliError(f"Pipeline {pipeline_id} operator #{index} inputs and outputs must be arrays")
+        _validate_count(pipeline_id, index, op_name, "input", len(inputs), min_inputs, max_inputs)
+        _validate_count(pipeline_id, index, op_name, "output", len(outputs), min_outputs, max_outputs)
+        _validate_non_nullable_slots(pipeline_id, index, op_name, "input", inputs, nullable_inputs)
+        _validate_non_nullable_slots(pipeline_id, index, op_name, "output", outputs, nullable_outputs)
+
+
+def _validate_count(
+    pipeline_id: str,
+    index: int,
+    op_name: str,
+    label: str,
+    count: int,
+    minimum: int,
+    maximum: Optional[int],
+) -> None:
+    if count < minimum or (maximum is not None and count > maximum):
+        expected = f"at least {minimum}" if maximum is None else f"exactly {minimum}" if minimum == maximum else f"{minimum} to {maximum}"
+        raise PackageCliError(
+            f"Pipeline {pipeline_id} operator #{index} {op_name} requires {expected} {label} tensor(s); got {count}"
+        )
+
+
+def _validate_non_nullable_slots(
+    pipeline_id: str,
+    index: int,
+    op_name: str,
+    label: str,
+    refs: Sequence[Any],
+    nullable_slots: set[int],
+) -> None:
+    for ref_index, ref in enumerate(refs):
+        if ref is None and ref_index not in nullable_slots:
+            raise PackageCliError(
+                f"Pipeline {pipeline_id} operator #{index} {op_name} does not allow null {label} slot {ref_index}"
+            )
+
+
+def _validate_attr_count(pipeline_id: str, index: int, op_name: str, attrs: Sequence[str]) -> None:
+    required = 0
+    maximum: Optional[int] = 0
+    if op_name in {"ARITHMETIC_COMPOSE", "CONVERT_COLOR", "CUSTOMIZED_COMPARE"}:
+        required = maximum = 1
+    elif op_name in {"NORMALIZE", "NMS", "SORT_MAT", "NORM"}:
+        maximum = 1
+    elif op_name in {
+        "UPDATE_GLTF",
+        "RENDER_TEXT",
+        "SSMR_UPDATE_COMPONENT",
+        "MICROPHONE",
+        "SPEAKER",
+        "JS_SCRIPTING",
+    }:
+        required = maximum = 1
+    if len(attrs) < required:
+        raise PackageCliError(
+            f"Pipeline {pipeline_id} operator #{index} {op_name} requires at least {required} attrs value(s)"
+        )
+    if maximum is not None and len(attrs) > maximum:
+        raise PackageCliError(
+            f"Pipeline {pipeline_id} operator #{index} {op_name} accepts at most {maximum} attrs value(s)"
+        )
+    if op_name == "MICROPHONE":
+        try:
+            validate_microphone_attrs(
+                list(attrs),
+                f"Pipeline {pipeline_id} operator #{index} MICROPHONE",
+            )
+        except ValueError as exc:
+            raise PackageCliError(str(exc)) from exc
 
 
 def _format_mode_operator_details(items: Sequence[tuple[str, str]]) -> str:

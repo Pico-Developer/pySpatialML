@@ -34,6 +34,7 @@ from pyspatialml import litert_runtime
 from pyspatialml.litert_tools import LiteRTToolError, resolve_litert_cli
 from pyspatialml.pipeline_cli import PipelineCliError, _load_input_array
 from pyspatialml.zip_utils import ZipSafetyError, safe_extract_zip
+from securemr.py2smr.verifier import validate_pipeline_spec
 
 
 class RunCliError(RuntimeError):
@@ -151,6 +152,7 @@ def run_device(
     as_json: bool = False,
 ) -> int:
     """Run a pipeline package on a connected device through a runner APK."""
+    pipeline_ids = _normalize_pipeline_ids(pipeline_ids)
     normalized_mode = _validate_run_package_target(target, mode=mode)
     _validate_device_run_args(
         inputs=inputs,
@@ -302,6 +304,11 @@ def _validate_manifest_pipeline_files(root: Path, manifest: Mapping[str, Any]) -
         path = _resolve_manifest_path(root, path_value, label="pipeline")
         if not path.is_file():
             raise RunCliError(f"Package manifest pipeline file not found: {path_value}. {_PACKAGE_TARGET_HINT}")
+        try:
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            validate_pipeline_spec(spec)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise RunCliError(f"Invalid pipeline '{path_value}': {exc}") from exc
 
 
 def _resolve_manifest_path(root: Path, path_value: str, *, label: str) -> Path:
@@ -483,6 +490,10 @@ def _print_host_summary(results: Sequence[HostPipelineResult], total_elapsed_ms:
     print(_section_header("End Host Outputs"))
 
 
+def _normalize_pipeline_ids(pipeline_ids: Sequence[str]) -> list[str]:
+    return [pipeline_id.strip() for pipeline_id in pipeline_ids if pipeline_id.strip()]
+
+
 def _resolve_pipeline_targets(target: Path, *, pipeline_ids: Sequence[str]) -> tuple[list[PipelineRunTarget], PackageContext]:
     if target.is_file() and target.suffix.lower() == ".json":
         raise RunCliError(f"Raw pipeline JSON is not a valid run target: {target}. {_PACKAGE_TARGET_HINT}")
@@ -570,8 +581,8 @@ def _tensor_spec_shape(tensor_spec: Mapping[str, Any]) -> Optional[tuple[int, ..
         return None
     channels = int(tensor_spec.get("channels", 1) or 1)
     if len(dims) >= 2:
-        height = int(dims[1])
-        width = int(dims[0])
+        height = int(dims[0])
+        width = int(dims[1])
         return (height, width, channels) if channels > 1 else (height, width)
     if len(dims) == 1:
         return (int(dims[0]), channels) if channels > 1 else (int(dims[0]),)
@@ -631,10 +642,9 @@ def _force_host_model_backend_cpu(spec: dict[str, Any]) -> None:
     for op in operators:
         if not isinstance(op, dict):
             continue
-        op_type = str(op.get("type") or op.get("operator_type") or "").upper()
-        if "RUN_MODEL_INFERENCE" not in op_type and "RUN_ALGORITHM" not in op_type:
+        op_type = op.get("type")
+        if op_type != "XR_SECURE_MR_OPERATOR_TYPE_RUN_MODEL_INFERENCE_PICO":
             continue
-        op["model_target"] = "cpu"
         model = op.get("model")
         if isinstance(model, dict):
             model["model_target"] = "cpu"
@@ -650,9 +660,28 @@ def _apply_default_image_input(
     for op in normalized.get("operators", []):
         if not isinstance(op, dict):
             continue
-        op_type = str(op.get("type") or op.get("operator_type") or "").upper()
+        op_type = str(op.get("type") or "").upper()
         if "RECTIFIED_VST_ACCESS" in op_type:
-            op["image_path"] = str(image_path)
+            try:
+                image = _load_input_array(image_path)
+            except PipelineCliError as exc:
+                raise RunCliError(str(exc)) from exc
+            output_names = [
+                ref.get("tensor")
+                for ref in op.get("outputs", [])
+                if isinstance(ref, dict) and isinstance(ref.get("tensor"), str)
+            ]
+            for name in output_names[:2]:
+                tensor_spec = normalized.get("tensors", {}).get(name)
+                if isinstance(tensor_spec, Mapping):
+                    dimensions = tensor_spec.get("dimensions")
+                    channels = int(tensor_spec.get("channels", 1) or 1)
+                    if isinstance(dimensions, list) and len(dimensions) >= 2:
+                        target_shape = (int(dimensions[0]), int(dimensions[1]))
+                        if channels > 1:
+                            target_shape += (channels,)
+                        image = _normalize_input_array(image, target_shape)
+                input_values.setdefault(name, image)
             applied = True
     if not applied:
         targets = _default_image_tensor_names(normalized)
